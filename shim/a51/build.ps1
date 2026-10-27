@@ -23,12 +23,17 @@ try {
     if ($LASTEXITCODE) { throw 'main.c failed' }
     & $cc @cflags '-c' 'ufs_probe.c' '-o' 'out/ufs_probe.o'
     if ($LASTEXITCODE) { throw 'ufs_probe.c failed' }
+    & $cc @cflags '-c' 'payload_boot.c' '-o' 'out/payload_boot.o'
+    if ($LASTEXITCODE) { throw 'payload_boot.c failed' }
+    & $cc @cflags '-c' '../fdt.c' '-o' 'out/fdt.o'
+    if ($LASTEXITCODE) { throw '../fdt.c failed' }
 
-    $rel = & (Join-Path $tool 'aarch64-none-elf-readelf.exe') '-r' 'out/start.o' 'out/main.o' 'out/ufs_probe.o'
+    $objs = @('out/start.o', 'out/main.o', 'out/ufs_probe.o', 'out/payload_boot.o', 'out/fdt.o')
+    $rel = & (Join-Path $tool 'aarch64-none-elf-readelf.exe') '-r' @objs
     $abs = ($rel | Select-String 'ABS64').Count
     if ($abs -ne 0) { throw "$abs absolute relocations; image would not be relocatable" }
 
-    & $cc @cflags '-static' '-T' 'a51.ld' '-Wl,--build-id=none' '-Wl,--no-warn-rwx-segments' '-Wl,-N' 'out/start.o' 'out/main.o' 'out/ufs_probe.o' '-o' 'out/loader.elf'
+    & $cc @cflags '-static' '-T' 'a51.ld' '-Wl,--build-id=none' '-Wl,--no-warn-rwx-segments' '-Wl,-N' @objs '-o' 'out/loader.elf'
     if ($LASTEXITCODE) { throw 'link failed' }
     & (Join-Path $tool 'aarch64-none-elf-objcopy.exe') '-O' 'binary' 'out/loader.elf' 'out/loader.bin'
     if ($LASTEXITCODE) { throw 'objcopy failed' }

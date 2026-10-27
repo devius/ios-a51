@@ -18,12 +18,15 @@ mkdir -p out
 $CC $CFLAGS -c start.S -o out/start.o
 $CC $CFLAGS -c main.c -o out/main.o
 $CC $CFLAGS -c ufs_probe.c -o out/ufs_probe.o
+$CC $CFLAGS -c payload_boot.c -o out/payload_boot.o
+$CC $CFLAGS -c ../fdt.c -o out/fdt.o
 
-abs=$($READELF -r out/start.o out/main.o out/ufs_probe.o | grep -c ABS64 || true)
+OBJS="out/start.o out/main.o out/ufs_probe.o out/payload_boot.o out/fdt.o"
+abs=$($READELF -r $OBJS | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations" >&2; exit 1; }
 
 $CC $CFLAGS -static -T a51.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-    out/start.o out/main.o out/ufs_probe.o -o out/loader.elf
+    $OBJS -o out/loader.elf
 $OBJCOPY -O binary out/loader.elf out/loader.bin
 
 size=$($NM out/loader.elf | awk '$3=="_end"{print strtonum("0x"$1)}')

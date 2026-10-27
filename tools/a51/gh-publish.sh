@@ -28,7 +28,7 @@ git status --porcelain --ignored | awk '$1=="!!"{print "  ignored: "$2}' | head
 echo "-- any backup/research/ipsw/serial leaked into the index? --"
 git diff --cached --name-only | grep -E '^backup/|^research/|\.ipsw$|\.img$|\.dtb$' | head
 git diff --cached --name-only | wc -l | xargs echo "  index file count:"
-git grep --cached -lE 'RZ8[A-Z0-9]{8}|ghp_[A-Za-z0-9]{20}|github_pat_' -- . 2>/dev/null | head
+git grep --cached -lE 'RZ8[A-Z0-9]{8}|gh[p]_[A-Za-z0-9]{20}|github[_]pat_' -- . 2>/dev/null | head
 echo "  (nothing above = clean)"
 
 git commit -q -m "A51 (SM-A515F, Exynos 9611) bring-up: shim, board layer, patch 0125

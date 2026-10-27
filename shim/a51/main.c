@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "ufs_probe.h"
+#include "payload_boot.h"
+#include "report.h"
+#include "../fdt.h"
 
 #define BIT(n)              (1U << (n))
 
@@ -90,19 +93,19 @@ static unsigned report_len;
 static void write_ramoops_dmesg(void);
 static void write_ramoops_pmsg(void);
 
-static void rputc(char c)
+void rputc(char c)
 {
     if (report_len + 1 < REPORT_MAX)
         report[report_len++] = c;
 }
 
-static void rputs(const char *s)
+void rputs(const char *s)
 {
     while (*s)
         rputc(*s++);
 }
 
-static void rhex64(uint64_t v)
+void rhex64(uint64_t v)
 {
     rputs("0x");
     for (int shift = 60; shift >= 0; shift -= 4) {
@@ -111,9 +114,9 @@ static void rhex64(uint64_t v)
     }
 }
 
-static void rhex32(uint32_t v) { rhex64(v); }
+void rhex32(uint32_t v) { rhex64(v); }
 
-static void rdec(uint64_t v)
+void rdec(uint64_t v)
 {
     char tmp[24];
     int n = 0;
@@ -122,7 +125,7 @@ static void rdec(uint64_t v)
     while (n) rputc(tmp[--n]);
 }
 
-static void rkv(const char *key, uint64_t value)
+void rkv(const char *key, uint64_t value)
 {
     rputs("  ");
     rputs(key);
@@ -131,7 +134,7 @@ static void rkv(const char *key, uint64_t value)
     rputc('\n');
 }
 
-static void rkv32(const char *key, uint32_t value)
+void rkv32(const char *key, uint32_t value)
 {
     rputs("  ");
     rputs(key);
@@ -154,7 +157,7 @@ static const struct sink sinks[] = {
     { LOG_PSTORE, 0x1f0000 },
 };
 
-static void emit_report(void)
+void emit_report(void)
 {
     report[report_len] = 0;
     for (unsigned i = 0; i < sizeof(sinks) / sizeof(sinks[0]); ++i) {
@@ -168,7 +171,7 @@ static void emit_report(void)
     write_ramoops_pmsg();
 }
 
-static void append_marker(const char *tag)
+void append_marker(const char *tag)
 {
     rputs("\n=== A51SHIM6 ");
     rputs(tag);
@@ -748,7 +751,7 @@ static void log_write(uintptr_t base, const uint64_t *rec, unsigned words)
     dcache_clean(base, base + words * 8U);
 }
 
-static void log_field(unsigned slot, uint64_t value)
+void log_field(unsigned slot, uint64_t value)
 {
     static const uintptr_t bases[] = { LOG_AVC, LOG_TSP, LOG_DISP, LOG_DEBUG };
     for (unsigned i = 0; i < 4; ++i) {
@@ -872,7 +875,37 @@ void a51_main(uintptr_t fdt, uint64_t current_el, uintptr_t image_pa)
     rtc_read(&rtc_before);
     rtc_report("before", &rtc_before);
     append_marker("captured");
+
+    /* Prove the FDT walk works against S-Boot's live tree before the kernel
+     * handoff depends on it. */
+    {
+        uint64_t rd_s = 0, rd_e = 0;
+        int have_s = fdt_chosen_u64(fdt, "linux,initrd-start", &rd_s);
+        int have_e = fdt_chosen_u64(fdt, "linux,initrd-end", &rd_e);
+        rkv("fdt_initrd_start_found", (uint64_t)have_s);
+        rkv("fdt_initrd_end_found", (uint64_t)have_e);
+        rkv("initrd_start", rd_s);
+        rkv("initrd_end", rd_e);
+        rkv("initrd_size", have_s && have_e ? rd_e - rd_s : 0);
+        rkv("payload_magic_ok", (uint64_t)payload_present(fdt, 0));
+    }
     emit_report();
+
+    /* If the boot image carries a SWEETXNU payload this is a kernel boot, not a
+     * diagnostic one: hand off immediately. Skip the UFS probe (it would take
+     * over the transfer request list the kernel expects to re-initialise) and
+     * the display dashboard (the kernel owns the framebuffer from here). */
+    if (payload_present(fdt, 0)) {
+        rputs("\nSWEETXNU payload present in the ramdisk: handing off\n");
+        emit_report();
+        if (payload_boot(fdt) == 0) {
+            for (;;)
+                __asm__ volatile("wfe");   /* not reached */
+        }
+        rputs("payload handoff failed, falling back to diagnostics\n");
+        append_marker("payload failed");
+        emit_report();
+    }
 
     /* Telemetry that survives even when the RAM log cannot be read back. */
     rtc_write_telemetry(1, (unsigned)runs, 0, decon_ctl, decon_trig,

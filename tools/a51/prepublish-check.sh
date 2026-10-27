@@ -32,8 +32,8 @@ find . -path ./.git -prune -o -type f \( -name '*.md' -o -name '*.py' -o -name '
 echo
 echo "== secret / identity scan =="
 grep -rn --exclude-dir=.git --exclude-dir=backup --exclude-dir=research \
-     -E 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|RZ8[A-Z0-9]{8}' . |
-     sed 's/\(ghp_\|github_pat_\)[A-Za-z0-9_]*/\1<redacted>/g' | head -20
+     -E 'gh[p]_[A-Za-z0-9]{20,}|github[_]pat_[A-Za-z0-9_]{20,}|RZ8[A-Z0-9]{8}' . |
+     sed 's/\(gh[p]_\|github[_]pat_\)[A-Za-z0-9_]*/\1<redacted>/g' | head -20
 echo "  (empty above = clean)"
 
 echo

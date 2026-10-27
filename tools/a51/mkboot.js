@@ -23,14 +23,16 @@ function fail(msg) {
 }
 
 function parseArgs(argv) {
-  const out = { list: false, force: 'auto' };
+  const out = { list: false, force: 'auto', ramdiskForce: 'auto' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--list') out.list = true;
     else if (a === '--stock') out.stock = argv[++i];
     else if (a === '--kernel') out.kernel = argv[++i];
+    else if (a === '--ramdisk') out.ramdisk = argv[++i];
     else if (a === '--out') out.out = argv[++i];
     else if (a === '--force') out.force = argv[++i];
+    else if (a === '--ramdisk-compress') out.ramdiskForce = argv[++i];
     else fail('unknown argument ' + a);
   }
   if (!out.stock) fail('--stock is required');
@@ -153,42 +155,59 @@ function describe(file) {
   return img;
 }
 
-function build(stockFile, kernelFile, outFile, force) {
+function build(stockFile, kernelFile, ramdiskFile, outFile, force, ramdiskForce) {
   const img = describe(stockFile);
-  let kernel = fs.readFileSync(kernelFile);
-  if (kernel.length === 0) fail('kernel payload is empty');
+  let kernel = kernelFile ? fs.readFileSync(kernelFile) : null;
+  if (kernel && kernel.length === 0) fail('kernel payload is empty');
 
   const stockMagic = magicOf(sectionOf(img, 'kernel'));
-  const mode = force === 'auto' ? stockMagic : force;
-  if (mode !== 'gzip' && mode !== 'raw') fail('unsupported --force ' + mode);
-
-  if (mode === 'gzip') {
-    kernel = zlib.gzipSync(kernel, { level: 9 });
-  } else if (stockMagic !== 'raw') {
-    console.warn(`warning: stock kernel is ${stockMagic}, writing raw payload`);
+  if (kernel) {
+    const mode = force === 'auto' ? stockMagic : force;
+    if (mode !== 'gzip' && mode !== 'raw') fail('unsupported --force ' + mode);
+    if (mode === 'gzip') {
+      kernel = zlib.gzipSync(kernel, { level: 9 });
+    } else if (stockMagic !== 'raw') {
+      console.warn(`warning: stock kernel is ${stockMagic}, writing raw payload`);
+    }
+    if (kernel.length > 64 * 1024 * 1024) fail('kernel payload suspiciously large');
+  } else {
+    kernel = sectionOf(img, 'kernel');
   }
 
-  if (kernel.length > 64 * 1024 * 1024) fail('kernel payload suspiciously large');
+  // Ramdisk: the SWEETXNU payload travels here, because S-Boot decompresses it
+  // and advertises it to the kernel through /chosen/linux,initrd-{start,end}.
+  let ramdisk = sectionOf(img, 'ramdisk');
+  const stockRdMagic = magicOf(ramdisk);
+  if (ramdiskFile) {
+    ramdisk = fs.readFileSync(ramdiskFile);
+    if (ramdisk.length === 0) fail('ramdisk payload is empty');
+    const rdMode = ramdiskForce === 'auto' ? stockRdMagic : ramdiskForce;
+    if (rdMode === 'gzip') ramdisk = zlib.gzipSync(ramdisk, { level: 9 });
+    else if (rdMode !== 'raw') fail('unsupported --ramdisk-compress ' + rdMode);
+  }
 
   const headerPages = img.page;
   const parts = [];
   const header = Buffer.from(img.buf.subarray(0, headerPages));
   header.writeUInt32LE(kernel.length, 8);
+  header.writeUInt32LE(ramdisk.length, 16);
   parts.push(header);
 
-  parts.push(kernel);
-  parts.push(Buffer.alloc(align(kernel.length, img.page) - kernel.length));
+  const writeSection = (data) => {
+    parts.push(data);
+    const pad = align(data.length, img.page) - data.length;
+    if (pad) parts.push(Buffer.alloc(pad));
+  };
+  writeSection(kernel);
   let written = headerPages + align(kernel.length, img.page);
 
   const order = ['ramdisk', 'second', 'recovery_dtbo', 'dtb', 'dt'];
   for (const name of order) {
     const s = img.sections.find((x) => x.name === name);
-    if (!s) continue;
-    const data = img.buf.subarray(s.start, s.start + s.size);
-    parts.push(data);
-    const pad = align(s.size, img.page) - s.size;
-    if (pad) parts.push(Buffer.alloc(pad));
-    written += align(s.size, img.page);
+    const data = name === 'ramdisk' ? ramdisk : (s ? img.buf.subarray(s.start, s.start + s.size) : null);
+    if (data === null) continue;
+    writeSection(data);
+    written += align(data.length, img.page);
   }
 
   // Preserve everything after the last parsed section (Samsung trailer,
@@ -200,15 +219,16 @@ function build(stockFile, kernelFile, outFile, force) {
   const out = Buffer.concat(parts);
   fs.writeFileSync(outFile, out);
   console.log('');
-  console.log(`kernel written  : ${kernel.length} bytes (${mode})`);
+  console.log(`kernel          : ${kernel.length} bytes (${kernelFile ? (force === 'auto' ? stockMagic : force) : 'stock, unchanged'})`);
+  console.log(`ramdisk         : ${ramdisk.length} bytes (${ramdiskFile ? (ramdiskForce === 'auto' ? stockRdMagic : ramdiskForce) : 'stock, unchanged'})`);
   console.log(`output          : ${outFile} (${out.length} bytes)`);
   console.log(`sha256          : ${require('crypto').createHash('sha256').update(out).digest('hex')}`);
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (args.list || !args.kernel) {
+if (args.list || (!args.kernel && !args.ramdisk)) {
   describe(args.stock);
 } else {
-  if (!args.out) fail('--out is required when --kernel is given');
-  build(args.stock, args.kernel, args.out, args.force);
+  if (!args.out) fail('--out is required when --kernel or --ramdisk is given');
+  build(args.stock, args.kernel, args.ramdisk, args.out, args.force, args.ramdiskForce);
 }

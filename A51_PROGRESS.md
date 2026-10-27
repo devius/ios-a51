@@ -443,8 +443,46 @@ lzfse (the Windows `lzfse.exe` covers the im4p case).
 The first block of `userdata` (LBA `0x1f7500`) is high-entropy with no f2fs,
 ext4 or HFS+ magic, i.e. Android's metadata encryption is active (the `metadata`
 partition at LBA `0x16900` holds the key). Putting the iOS 16.7.16 HFS+ root
-there means overwriting it and losing the Android installation; that needs
-explicit confirmation before it happens.
+there means overwriting it and losing the Android installation.
+
+**Authorisation: granted by the user on 2026-10-27** ("Разрешаю перезаписать
+userdata"). Scope of that permission: write the iOS rootfs to `userdata`
+(LBA `0x1f7500 … 0x1dc98ff`) when Phase 5 gets there. It does **not** extend to
+any other partition — `boot` stays the only other writable target, and
+`bootloader/efs/sec_efs/cpefs/modem/persist/param/up_param/recovery/vbmeta/
+vbmeta_samsung/misc/keydata/keystorage/keyrefuge/steady/uh/uhcfg/spu/omr/bota/
+dtbo` remain read-only or untouched.
+
+---
+
+## Waiting on: a write-capable GitHub token
+
+The kernel can only be built by `.github/workflows/xnu.yml` on `macos-14`.
+The token supplied on 2026-10-27 (fine-grained, expires 2027-01-25) is
+**read-only**: `git ls-remote` succeeds on every repo, but `POST /user/repos`,
+`POST /repos/.../forks` and `POST /repos/.../git/refs` all return
+`403 Resource not accessible by personal access token`. Probes are in
+`tools/a51/gh-token-check.sh`, `gh-capabilities.sh`, `gh-token-probe.sh` (the
+last one creates and immediately deletes a throwaway ref to test write access).
+
+What is needed, either form:
+* **fine-grained PAT** with *Contents: Read and write* + *Actions: Read and
+  write* on at least one public repo (plus *Administration: Read and write* if a
+  dedicated `ios-a51` repo should be created), or
+* **classic PAT** with the `repo` and `workflow` scopes.
+
+Everything else is staged: the local git repo is initialised with one commit
+(`9792b5f…`, 273 files, 2.9 MB, `backup/` and `research/` excluded by
+`.gitignore`, no serials or tokens in tracked files — see
+`tools/a51/prepublish-check.sh`), the workflow is set to trigger on the
+`a51-bringup` branch, and `tools/a51/gh-push-branch.sh` pushes there without
+touching any existing branch.
+
+As soon as a write-capable token lands in
+`G:\a51-port\toolchain\gh_token.txt`, the remaining sequence is: push → watch
+the run → download the `xnu-kernel` artifact → `tools/mkadt_a51.py` +
+`tools/mkpayload.py` → `mkboot.js --kernel shim/a51/out/loader.bin --ramdisk
+payload.bin` → flash → read `/sys/fs/pstore/pmsg-ramoops-0` for the XNU console.
 
 ---
 
@@ -591,6 +629,30 @@ Screen was observed directly: colour bars + `HACKIOS SHIM A51 REV8 OK`.
 | 5 | `9b7dd444…291dc1fa` | **shim ran, panel dashboard** | `backup/live/boot7-dmesg-ramoops-0.txt` = `=== A51SHIM6 ===`; 25 s hold, 17,626,356 trigger loops, **1901 FRAME_DONE (76 fps)**, TE counters 0x875/0x8c5 |
 | 6 | `b38a2c57…28fe26` | **shim ran, UFS read-only probe succeeded** | `backup/live/boot8-dmesg-ramoops-0.txt`: GPT `EFI PART`, 128 GB, full partition table, `userdata` at LBA `0x1f7500` |
 | 7 | `d31bc53b…f755714` | **shim ran, read path self-verified** | `backup/live/boot9-dmesg-ramoops-0.txt`: LBA `0x6c90` reads back `ANDROID!` with `kernel_size=0xc45a` = 50266 = exactly the flashed `loader.bin`, `page_size=0x800`; `userdata` LBA `0x1f7500` is high-entropy (no f2fs/ext4/HFS magic) → metadata-encrypted |
+| 8 | `9aee5678…fd8b77fa0` | **shim ran, XNU handoff path validated** | `backup/live/boot10-dmesg-ramoops-0.txt`: `linux,initrd-start=0x89000000`, `initrd-end=0x891a0800` (1 705 984 B = the stock ramdisk), `payload_magic_ok=0` — the FDT walk and payload detection work against S-Boot's live tree |
+
+### Ready for the kernel: one image, two behaviours
+
+`shim/a51` now contains the payload handoff (`payload_boot.c`, adapted from the
+proven `shim/loader.c` / `shim/a5xelte/xnu_boot.c`) and the same binary is both
+the diagnostic and the loader:
+
+* ramdisk without a `SWEETXNU` payload → register capture, DPU survey, read-only
+  UFS probe, dashboard, 15 s trigger loop, PMU recovery reset (what runs today);
+* ramdisk **with** a payload → log the payload header, copy the segments to
+  `phys_base + (vmaddr - virt_base)`, place the ADT and `boot_args` behind the
+  kernel, fill `boot_args.Video` with `0xca000000` / 1080×2400 / stride 4320,
+  `deviceTreeP` as a VA, then `ic iallu` and jump with the MMU off.
+
+`tools/a51/mkboot.js` gained `--ramdisk <payload> [--ramdisk-compress auto|gzip|raw]`
+and rewrites the header's `ramdisk_size`; verified by repacking a dummy payload
+and re-listing the result (kernel 53946 B raw, ramdisk gzipped, DTB and the
+`SEANDROIDENFORCE` trailer untouched).
+
+The initrd lands at `0x89000000`, inside bank 0, while the XNU window is bank 1
+at `0x880000000` — `payload_boot()` refuses to run if they ever overlap.
+
+---
 
 Boot 5 replaced the colour bars with an instrument panel, because the screen is
 the one channel a human can read without a host: the complete 16-bit RGB565
