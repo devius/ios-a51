@@ -77,11 +77,44 @@ jobs:
           xcrun --find iig
 
       - name: Build
+        id: build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          # The kernel build prints tens of megabytes of -W warnings, and the
+          # runner truncates long step logs from the end -- which is exactly
+          # where make prints its errors (run 40452629749 died with exit 2 and
+          # no visible diagnostic). So: full output to a file that is uploaded
+          # as an artifact, and only the diagnostics to the console.
+          set +e
+          df -h / | tail -1
+          sysctl -n hw.memsize hw.ncpu | paste -sd' ' -
+          bash build.sh > ../build.log 2>&1
+          rc=$?
+          echo "build.sh exit=$rc  log=$(wc -c < ../build.log) bytes, $(wc -l < ../build.log) lines"
+          echo "disk after: $(df -h / | tail -1)"
+          echo "::group::make errors"
+          grep -nE 'error:|error generated|fatal error|Error [0-9]+|\*\*\* |ld: [^w]|Undefined symbols|No rule to make' ../build.log |
+            grep -v 'warning:' | tail -80 || true
+          echo "::endgroup::"
+          echo "::group::tail"
+          tail -40 ../build.log || true
+          echo "::endgroup::"
+          echo "::group::kernel artifacts in fakeroot"
+          ls -la fakeroot/System/Library/Kernels/ 2>&1 || true
+          echo "::endgroup::"
+          exit $rc
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 5
+          if-no-files-found: warn
 
       - name: Package build tree for local compiles
         if: always()
