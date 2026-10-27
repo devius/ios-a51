@@ -61,7 +61,16 @@ A51_HEADER_BLOCK = [
     '#define A5_FB_STRIDE                  4320        /* bytes per row, XRGB8888 */',
     '#define A5_FB_2M_BLOCKS               5           /* 1080*2400*4 = 10368000 */',
     '#define A5_DECON_PHYS                 0x148b0000  /* DECON_F, not the S8 0x12860000 */',
-    '#define A5_ENTRY_MARKER_PHYS          0xf9e9000c  /* pmsg zone data, see below */',
+    # start_first_cpu's earliest instruction sequence is an 8-byte store
+    # (str x11, [x10]) executed with the MMU still off, which makes it Device
+    # memory: unaligned accesses to Device memory always raise an alignment
+    # fault. VBAR_EL1 is not programmed until *after* that store, so the fault
+    # lands on S-Boot's stale vectors and the SoC watchdog resets the phone --
+    # that is boot 10's bootloop, and why "XNUELTE1" never reached pstore.
+    # 0xf9e9000c is the first byte of the record data (RAMOOPS_HDR_SIZE is 12)
+    # but only 4-byte aligned; +4 keeps it inside the record, still 8-byte
+    # aligned, and rewrites the report's first line to "=== XNUELTE1 ===".
+    '#define A5_ENTRY_MARKER_PHYS          0xf9e90010  /* pmsg zone data + 4: 8-byte aligned (MMU-off Device store) */',
     '#define A5_BOOT_MPIDR                 0x0         /* A53 little cluster boots */',
     '#define A5_KEYS_DEFAULT               0           /* ALIVE is 0x11850000 on 9611, banks 5/6/7 pin 15; Phase 5 */',
     '#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100 on i2c 0x48: no driver yet */',

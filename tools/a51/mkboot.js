@@ -174,8 +174,12 @@ function build(stockFile, kernelFile, ramdiskFile, outFile, force, ramdiskForce)
     kernel = sectionOf(img, 'kernel');
   }
 
-  // Ramdisk: the SWEETXNU payload travels here, because S-Boot decompresses it
-  // and advertises it to the kernel through /chosen/linux,initrd-{start,end}.
+  // Ramdisk: the SWEETXNU payload travels here. S-Boot does NOT decompress the
+  // ramdisk -- it copies the section verbatim to 0x89000000 and advertises it
+  // through /chosen/linux,initrd-{start,end} -- so the shim sees exactly the
+  // bytes we put in. tools/a51/make-boot.ps1 therefore asks for
+  // --ramdisk-compress raw; 'auto' (copy the stock magic, gzip) is only a
+  // generic-repacker default and makes the shim reject its own payload.
   let ramdisk = sectionOf(img, 'ramdisk');
   const stockRdMagic = magicOf(ramdisk);
   if (ramdiskFile) {

@@ -58,7 +58,7 @@ diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 +#define A5_FB_STRIDE                  4320        /* bytes per row, XRGB8888 */
 +#define A5_FB_2M_BLOCKS               5           /* 1080*2400*4 = 10368000 */
 +#define A5_DECON_PHYS                 0x148b0000  /* DECON_F, not the S8 0x12860000 */
-+#define A5_ENTRY_MARKER_PHYS          0xf9e9000c  /* pmsg zone data, see below */
++#define A5_ENTRY_MARKER_PHYS          0xf9e90010  /* pmsg zone data + 4: 8-byte aligned (MMU-off Device store) */
 +#define A5_BOOT_MPIDR                 0x0         /* A53 little cluster boots */
 +#define A5_KEYS_DEFAULT               0           /* ALIVE is 0x11850000 on 9611, banks 5/6/7 pin 15; Phase 5 */
 +#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100 on i2c 0x48: no driver yet */

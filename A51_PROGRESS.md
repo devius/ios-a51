@@ -324,7 +324,10 @@ the gzip ramdisk (1705726 bytes), the DTB (134936 bytes), the `SEANDROIDENFORCE`
 trailer and the ~23 MB of trailing partition padding are carried over
 byte-for-byte, and only the kernel slot changes. It gzips the payload
 automatically if the stock kernel is gzip-compressed; here the stock kernel is a
-raw `Image`, so the payload goes in raw. The first two test images were built
+raw `Image`, so the payload goes in raw. **Correction (boot 9):** what matters is
+the *ramdisk*, not the kernel — S-Boot never decompresses it, so a gzipped
+ramdisk is invisible to the payload finder; `make-boot.ps1 -RamdiskCompress`
+(default `raw`) now controls this. The first two test images were built
 from `OrangeFox-Unofficial-a51.img` before the stock dump existed — same header
 version, page size and kernel format, so they were valid vehicles — but every
 result quoted below comes from the stock-based image.
@@ -535,10 +538,13 @@ command restarts it, after which `adb wait-for-device` blocks indefinitely.
 
 ## Device state at the end of this session
 
-- `boot` (sda12) holds the **stock** image again; sha256
-  `20baf0d0e48747f890bf2342a56993f1df5e6af02c77199116a839325cbfaa28`
-  verified three ways: local `backup/stock-boot.img`, readback of the partition
-  header, and the on-device copy `/sdcard/stock-boot.img`.
+- `boot` (sda12) holds the **boot-10** image (sha256
+  `88095b0a6bd59b860e59db94a40be9ab146be6fbf966432862d9aab40fd91135`,
+  39 739 392 B — the raw-ramdisk payload boot that reached XNU and faulted).
+  The stock image is preserved as local `backup/stock-boot.img` sha256
+  `20baf0d0e48747f890bf2342a56993f1df5e6af02c77199116a839325cbfaa28`,
+  verified three ways: the local file, readback of the partition header, and the
+  on-device copy `/sdcard/stock-boot.img`.
 - The phone was left in recovery (not rebooted into Android) so adb stays
   authorised.
 - Nothing but `boot` was ever written. `dtbo`, `vbmeta`, `efs`, `recovery`,
@@ -549,20 +555,26 @@ command restarts it, after which `adb wait-for-device` blocks indefinitely.
 
 ## Next actions, in order
 
-1. **Compile XNU.** Needs a Linux host or the project's GitHub Actions workflow:
-   `tools/dreamlte/prep-xnu-tree.sh` (fetch xnu-8796, apply 0001–0124), then
-   `tools/a51/apply-a51.py TREE` *or* `git am xnu/patches/0125-a51-exynos9611.patch`,
-   then build `MACHINE_CONFIG=A5XELTE` and pack with `tools/mkpayload.py` +
-   `tools/mkadt_a51.py`. This host cannot do it (no git, no clang, no WSL).
-2. **Boot 2/3 on device:** load the payload through `shim/a51` (extend it from
-   the diagnostic paint to the SWEETXNU payload handoff that
-   `shim/a5xelte/xnu_boot.c` already implements), `cpus=1`, and read the early
-   console back through the forged ramoops record at `0xf9d10000`. Target:
-   "Waiting for root device".
+1. **Compile XNU.** Done by `.github/workflows/xnu.yml` on `macos-14` (push to
+   `main` with `xnu/patches/**`). `dxb/build.sh` applies 0001–0125 and builds
+   `MACHINE_CONFIG=A5XELTE`; `tools/a51/gh-fetch-kernel.sh <run>` pulls the
+   `xnu-kernel` artifact into `out/kernel.development.a5xelte` (waits for the run
+   to finish) and prints the Build diagnostics and the LSE count (must be 0).
+2. **Boot the kernel:** `tools/a51/make-boot.ps1 -Kernel
+   out/kernel.development.a5xelte -Out out/boot-a51.img` (raw ramdisk is the
+   default: SWEETXNU payload + A51 ADT, `cpus=1`), then flash **manually, step
+   by step** — push → sha256 verify → `dd if=/tmp/boot-a51.img
+   of=/dev/block/by-name/boot bs=4096` → `sync` → readback compare (head 64 KiB
+   + ramdisk at `bs=4096 skip=14`) → `adb shell reboot`. `flash-boot.ps1` and
+   `pull-pstore.ps1` hang (PowerShell `| Out-String` buffering + `adb
+   wait-for-device`) and must not be used until fixed. Pull pstore to a fresh
+   `backup/logs/pstore-bootN/` dir; success signal is `=== XNUELTE1 ===`
+   (marker reached) and/or `--- XNU console ---`. Target: "Waiting for root
+   device".
 3. **Phase 4 UFS:** the host is UFSHCI 2.1 at `0x13520000` (CAP `0x1303ff0f`),
    PHY `0x13524000`, IRQ `0x9d`, and `userdata` is `sda32`. The S8's Exynos
-   quirks in `bsd/dev/sweet_ufs.c` are the starting hypothesis; confirm them
-   against a shim UFS probe before mounting the iOS 16.7.16 rootfs.
+   quirks in `bsd/dev/sweet_ufs.c` are the starting hypothesis; the probe above
+   already confirms them, including the LUN `0xD0` START STOP UNIT wake-up.
 4. **Phase 5 input:** keys are ALIVE `GPIO5_15`/`GPIO6_15`/`GPIO7_15`
    (`a5xelte_keys.c` scheme), touch is Melfas MMS100 at I2C `0x48` with IRQ on
    ALIVE `GPIO0_0` — a new driver, `A5_TOUCH_DEFAULT` is 0 until it exists.
@@ -662,6 +674,50 @@ Screen was observed directly: colour bars + `HACKIOS SHIM A51 REV8 OK`.
 | 6 | `b38a2c57…28fe26` | **shim ran, UFS read-only probe succeeded** | `backup/live/boot8-dmesg-ramoops-0.txt`: GPT `EFI PART`, 128 GB, full partition table, `userdata` at LBA `0x1f7500` |
 | 7 | `d31bc53b…f755714` | **shim ran, read path self-verified** | `backup/live/boot9-dmesg-ramoops-0.txt`: LBA `0x6c90` reads back `ANDROID!` with `kernel_size=0xc45a` = 50266 = exactly the flashed `loader.bin`, `page_size=0x800`; `userdata` LBA `0x1f7500` is high-entropy (no f2fs/ext4/HFS magic) → metadata-encrypted |
 | 8 | `9aee5678…fd8b77fa0` | **shim ran, XNU handoff path validated** | `backup/live/boot10-dmesg-ramoops-0.txt`: `linux,initrd-start=0x89000000`, `initrd-end=0x891a0800` (1 705 984 B = the stock ramdisk), `payload_magic_ok=0` — the FDT walk and payload detection work against S-Boot's live tree |
+| 9 | gzip image, sha not retained (overwritten by #10) | **gzip ramdisk rejected, self-diagnosed** | `backup/logs/pstore-boot9/pmsg-ramoops-0`: `initrd_size=0x5e2800` (stock ramdisk + *gzipped* payload), `payload_magic_ok=0` → shim requested recovery. **S-Boot does not decompress the ramdisk** — it copies bytes verbatim to `0x89000000` and only advertises `/chosen/linux,initrd-{start,end}`; `make-boot.ps1` gained `-RamdiskCompress raw` (now the default) |
+| 10 | `88095b0a6bd59b8…d91135` | **XNU entered, died on an alignment fault** | `backup/logs/pstore-boot10/pmsg-ramoops-0`: `payload_magic_ok=1`, all 10 segments copied (`__TEXT`…`__LINKEDIT`, `__DATA` vmsize 0x934000 > file 0x48000), `adt_pa=0x8828ac000`, `boot_args_pa=0x8828af000`, `topOfKernelData=0x8828b0000`, ends `=== A51SHIM6 jumping to XNU ===`; **`XNUELTE1` marker absent (grep 0) → fault inside `__start`**; phone bootlooped, operator recovered manually |
+
+> **Evidence naming:** `backup/logs/pstore-boot9|boot10/` are the two *payload*
+> boots (#9/#10 above). The older `backup/live/boot9|boot10-*.txt` files are two
+> earlier diagnostic boots (#7/#8) — distinguish them by `initrd_size`:
+> `0x1a0800` (stock ramdisk), `0x5e2800` (gzip payload), `0xfbc800` (raw payload).
+
+### Boot 10 root cause: an 8-byte Device-memory store with the MMU off
+
+The report stops at `=== A51SHIM6 jumping to XNU ===`, so the shim's job was
+done: `x0 = 0x8828af000` (boot_args PA), MMU/caches off, `ic iallu`. The kernel
+entry `__start` @ `0xfffffff007424488` is a single `b _start_first_cpu`
+(@ `0xfffffff0074260dc`), whose first A5XELTE sequence is:
+
+```asm
+movk x10, #0xf9e9, lsl #16
+movk x10, #0xc              ; x10 = 0xf9e9000c  (A5_ENTRY_MARKER_PHYS)
+movk x11, #0x3145, lsl #48  ; ... "XNUELTE1"
+str  x11, [x10]             ; 8-byte store, MMU still off → Device memory
+dsb  sy
+```
+
+* With the MMU off every access is Device/Strongly-ordered, and **unaligned
+  accesses to Device memory always raise a alignment fault** — `0xf9e9000c` is
+  only 4-byte aligned (it was picked to be the first byte of the pstore record
+  data, `RAMOOPS_HDR_SIZE` = 12).
+* `VBAR_EL1` is programmed only *after* this store (start.s:135-137), so the
+  fault lands on S-Boot's stale vectors → watchdog reset → bootloop.
+* Corroborating: `grep XNUELTE1` on the pulled pmsg = 0 hits, the pmsg header is
+  intact (a successful store would have overwritten `offset` and made pstore drop
+  the record), and `llvm-objdump` shows this `str x11, [x10]` is the **only**
+  8-byte store in the whole early path (`La5_draw_text` and the green block use
+  `str w`). The S8/A5 marker addresses (`0x920ff000`, `0x469ff100`) are 8-byte
+  aligned, which is why the donor never hit this.
+* The shim never writes SCTLR (MMU/D-cache stay off as S-Boot left them), and
+  `klog_init` maps the zone through `ml_io_map`, so the console path itself is
+  sound.
+
+**Fix (regenerated into 0125, both patch routes verified byte-identical):**
+`A5_ENTRY_MARKER_PHYS` → `0xf9e90010` (still inside the record, 8-byte aligned;
+rewrites the report's first line to `=== XNUELTE1 ===` at file offset 4).
+Next boot (#11) must show `=== XNUELTE1 ===` in `pmsg-ramoops-0`, then
+`--- XNU console ---` from `klog_init`, targeting "Waiting for root device".
 
 ### Ready for the kernel: one image, two behaviours
 

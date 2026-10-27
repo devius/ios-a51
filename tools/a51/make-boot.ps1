@@ -8,10 +8,16 @@
 #                      Image). S-Boot relocates the Image every boot, so the
 #                      shim is built relocation-free and finds its own base.
 #   boot.img ramdisk = the SWEETXNU payload (kernel segments + ADT + cmdline).
-#                      S-Boot decompresses the ramdisk and advertises it through
+#                      S-Boot does NOT decompress the ramdisk: it copies the
+#                      bytes as-is to 0x89000000 and advertises them through
 #                      /chosen/linux,initrd-{start,end}, which is where the shim
-#                      picks it up. Because the stock ramdisk is gzip, mkboot.js
-#                      gzips ours too by default (--ramdisk-compress auto).
+#                      picks it up and validates the SWEETXNU magic. Boot 9
+#                      proved this the hard way: with mkboot.js's default
+#                      (--ramdisk-compress auto, copying the stock gzip magic)
+#                      the shim saw the 6 170 624-byte gzip stream instead of
+#                      the payload and requested recovery. So the ramdisk is
+#                      written raw by default here; at 16 499 584 bytes it ends
+#                      at ~0x89FBC400, under the FDT at 0x8A100000.
 # The stock DTB and every trailing byte of the stock image are preserved.
 param(
     [Parameter(Mandatory = $true)][string]$Kernel,
@@ -19,13 +25,20 @@ param(
     [string]$Stock = 'backup\stock-boot.img',
     [string]$BootArgs = '',
     [string]$Canvas = '1080x2400',
+    [ValidateSet('raw', 'gzip')][string]$RamdiskCompress = 'raw',
     [switch]$SkipShim
 )
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $py = 'G:\a51-port\toolchain\python\python.exe'
 if (-not (Test-Path $py)) { throw "python missing: $py" }
-$node = 'node'
+# Node is not on PATH in this environment (installed outside Program Files).
+$node = 'E:\node.js\node.exe'
+if (-not (Test-Path $node)) {
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $cmd) { throw 'node not found (expected E:\node.js\node.exe)' }
+    $node = $cmd.Source
+}
 $work = Join-Path $repo 'out\a51-payload'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Join-Path $repo $Out)) | Out-Null
@@ -69,8 +82,23 @@ if ($LASTEXITCODE) { throw 'mkpayload failed' }
 Write-Host ''
 Write-Host '== boot image'
 & $node (Join-Path $repo 'tools\a51\mkboot.js') --stock $stockPath `
-    --kernel $loader --ramdisk $payload --out (Join-Path $repo $Out)
+    --kernel $loader --ramdisk $payload --ramdisk-compress $RamdiskCompress `
+    --out (Join-Path $repo $Out)
 if ($LASTEXITCODE) { throw 'mkboot failed' }
 
 Write-Host ''
-Get-FileHash (Join-Path $repo $Out) -Algorithm SHA256 | Format-List
+$img = Join-Path $repo $Out
+$size = (Get-Item $img).Length
+Write-Host "image size : $size bytes"
+if ($RamdiskCompress -eq 'raw') {
+    # S-Boot puts the ramdisk at 0x89000000; the FDT sits at 0x8a100000.
+    # PowerShell parses 0x89000000/0x8a100000 as negative Int32, so keep the
+    # whole comparison in Int64.
+    [int64]$rdBase = 2298478592      # 0x89000000
+    [int64]$fdtBase = 2316300288     # 0x8a100000
+    [int64]$end = $rdBase + (Get-Item $payload).Length
+    [int64]$headroom = $fdtBase - $end
+    Write-Host ('ramdisk end: 0x{0:x} (FDT 0x8a100000, headroom {1} bytes)' -f $end, $headroom)
+    if ($end -ge $fdtBase) { throw 'raw payload would overlap the FDT' }
+}
+Get-FileHash $img -Algorithm SHA256 | Format-List
