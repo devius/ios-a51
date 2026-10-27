@@ -1,7 +1,6 @@
 #!/bin/bash
-# Initialise the local git repo, create the public GitHub repo, and push.
-# The token is read from /mnt/g/a51-port/toolchain/gh_token.txt and is scrubbed
-# out of .git/config again as soon as the push succeeds.
+# Commit the current tree, create the public ios-a51 repo, push main and report
+# the workflow run that the push triggers. The token is never printed.
 set -uo pipefail
 REPO=/mnt/g/a51-port/ios-a51
 TOK=$(tr -d '\r\n' < /mnt/g/a51-port/toolchain/gh_token.txt)
@@ -13,53 +12,70 @@ api() { curl -s -o /tmp/gh_body -w '%{http_code}' -H "Authorization: Bearer $TOK
         -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
 
 cd "$REPO" || exit 1
-
-echo "== what would be published =="
-git init -q -b main 2>/dev/null || git init -q
 git config user.name "$OWNER"
 git config user.email "$OWNER@users.noreply.github.com"
 git config core.fileMode false
-git config core.autocrlf false
 git add -A
-echo "staged files: $(git diff --cached --name-only | wc -l)"
-echo "staged bytes: $(git diff --cached --name-only | xargs -r du -ch 2>/dev/null | tail -1)"
-echo "-- ignored directories that must NOT appear --"
-git status --porcelain --ignored | awk '$1=="!!"{print "  ignored: "$2}' | head
-echo "-- any backup/research/ipsw/serial leaked into the index? --"
-git diff --cached --name-only | grep -E '^backup/|^research/|\.ipsw$|\.img$|\.dtb$' | head
-git diff --cached --name-only | wc -l | xargs echo "  index file count:"
-git grep --cached -lE 'RZ8[A-Z0-9]{8}|gh[p]_[A-Za-z0-9]{20}|github[_]pat_' -- . 2>/dev/null | head
-echo "  (nothing above = clean)"
 
-git commit -q -m "A51 (SM-A515F, Exynos 9611) bring-up: shim, board layer, patch 0125
+git commit -q -F - <<'MSG'
+a51: extend the board layer to the DREAMLTE guards the A51 needs
 
-Boot 1 verified on hardware: S-Boot hands off at EL1/MMU off on MPIDR 0,
-framebuffer 0xca000000 1080x2400 is scanned out by dpp@0x14881000, DECON_F is
-in command mode and needs no reprogramming, GICD 0x12301000 reads 0xfcef with
-the distributor off, UFSHCI 2.1 at 0x13520000 wakes with START STOP UNIT to
-WLUN 0xd0 and the GPT reads back (userdata at LBA 0x1f7500).
+0125 now does three things instead of one:
 
-Evidence channel: the shim forges a persistent_ram record in the ramoops dump
-zone (0xf9d10000) which recovery exposes as /sys/fs/pstore/dmesg-ramoops-0;
-this recovery has neither /dev/mem nor /proc/kcore, and the sec_* log regions
-do not survive. The kernel console ring goes to the pmsg zone (0xf9e90000).
+1. Board block in A5XELTE.h with the measured A51 values: framebuffer
+   0xca000000 1080x2400 stride 4320 (confirmed by dpp@0x14881000
+   IN_BASE_ADDR_Y and by the panel showing the shim paint), DECON_F
+   0x148b0000, boot MPIDR 0, 26 MHz physical timer (INTID 30), kernel log in
+   the ramoops PMSG zone 0xf9e90000, keys and touch off until Phase 5.
 
-Adds tools/a51 (mkboot.js, apply-a51.py, mkpatch0125.py, verify-patch0125.py,
-fdtdump.py, phase1-dump2.ps1, flash-test1.ps1, pull-log.ps1), shim/a51,
-tools/mkadt_a51.py and xnu/patches/0125-a51-exynos9611.patch." || true
+2. UFS identity: ADT node /a51-ufs and lower-case "userdata" (the A51 GPT
+   names are lower case; the S8's were not).
+
+3. Guard extension. 0124 wrapped its new code in #if defined(DREAMLTE); the
+   board-neutral parts are now (defined(DREAMLTE) || defined(A51)):
+   the ramoops console copy in pe_serial.c (the only readable kernel log on
+   this device - it has no /dev/mem and no /proc/kcore), the framebuffer VA
+   reservation and the deterministic physmap in arm_vm_init.c, and the CPU_ON
+   trampoline for a high-bank entry in SweetCPU.cpp. SweetFramebuffer.cpp gets
+   the frame-done wait with a parameterised A5_DECON_PHYS instead of the S8's
+   hard-coded 0x12860000.
+   Deliberately left S8-only: the MPIDR topology (A51 measured A53 = 0x0-0x3
+   as the boot cluster, which is the existing A5XELTE branch), the iPhone-X
+   logical display size, the S6SY761 touch driver and the S8 key sampling.
+
+Verified on a real xnu-8796.141.3 tree: 0125 applies with plain git apply, and
+tools/a51/verify-board-routes.sh shows the patch route and the apply-a51.py
+route produce identical trees.
+MSG
+echo "HEAD: $(git rev-parse --short HEAD)  files: $(git ls-files | wc -l)"
 
 echo
-echo "== create the GitHub repo =="
-code=$(api -X POST https://api.github.com/user/repos \
-  -d "{\"name\":\"$NAME\",\"private\":false,\"has_issues\":true,\"has_wiki\":false,\"description\":\"iOS 16 XNU port for Samsung Galaxy A51 (SM-A515F, Exynos 9611)\"}")
+echo "== create the public repo =="
+code=$(api -X POST https://api.github.com/user/repos -d \
+  "{\"name\":\"$NAME\",\"private\":false,\"has_issues\":true,\"has_wiki\":false,\"auto_init\":false,\"description\":\"iOS 16 XNU port for Samsung Galaxy A51 (SM-A515F, Exynos 9611)\"}")
 echo "POST /user/repos -> $code"
-head -c 400 /tmp/gh_body; echo
+head -c 300 /tmp/gh_body; echo
 
 echo
-echo "== push =="
+echo "== push main =="
 git remote remove origin 2>/dev/null
 git remote add origin "https://$OWNER:$TOK@github.com/$OWNER/$NAME.git"
-git push -u origin main 2>&1 | sed -E "s#$TOK#<token>#g" | tail -5
+git push -u origin main 2>&1 | sed -E "s#$TOK#<token>#g" | tail -6
 git remote set-url origin "$CLEAN_URL"
-echo "remote is now: $(git remote get-url origin)"
-echo "HEAD: $(git rev-parse HEAD)"
+echo "remote: $(git remote get-url origin)"
+
+echo
+sleep 8
+echo "== workflow runs =="
+code=$(api "https://api.github.com/repos/$OWNER/$NAME/actions/runs?per_page=5")
+echo "GET /actions/runs -> $code"
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/gh_body'))
+runs = d.get('workflow_runs', [])
+if not runs:
+    print('  no runs yet')
+for r in runs:
+    print(f"  {r['id']} {r['name']} {r['status']}/{r.get('conclusion')} "
+          f"branch={r['head_branch']} {r['html_url']}")
+PY

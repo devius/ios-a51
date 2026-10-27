@@ -1,29 +1,45 @@
 Galaxy A51 (SM-A515F, Exynos 9611) board layer, on top of 0124.
 
-Board facts measured on hardware by shim/a51 and recorded in
-A51_PROGRESS.md: framebuffer 0xca000000 1080x2400 stride 4320
-(confirmed by dpp@0x14881000 IN_BASE_ADDR_Y and by the panel
-showing the shim paint), boot CPU MPIDR 0 (Cortex-A53), GICD
-0x12301000 / GICC 0x12302000 disabled at handoff, 26 MHz
-physical timer (INTID 30), UFSHCI 2.1 at 0x13520000, and the
-log channel is the ramoops dump zone at 0xf9d10000 which recovery
-exposes as /sys/fs/pstore/dmesg-ramoops-0.
+Flips the board selector from DREAMLTE to A51, adds the measured A51 board
+block, and extends the DREAMLTE guards that are board-neutral so the A51 gets
+the ramoops console copy (pexpert/arm/pe_serial.c), the framebuffer VA
+reservation and deterministic physmap (osfmk/arm64/arm_vm_init.c), the CPU_ON
+trampoline for a high-bank entry (iokit/Kernel/arm/SweetCPU.cpp) and the
+frame-done wait before each copy (iokit/Kernel/arm/SweetFramebuffer.cpp, with
+the A51 DECON base).
+
+Deliberately NOT extended: the S8 MPIDR topology (A51 measured A53 = MPIDR
+0x0-0x3 as the boot cluster, which is the existing A5XELTE branch), the S8
+logical display size (A51 presents its native 1080x2400), the S6SY761 touch
+driver (A51 has a Melfas MMS100) and the S8 key sampling (A51 ALIVE pinctrl is
+0x11850000 with the keys on banks 5/6/7 pin 15; A5_KEYS_DEFAULT is 0 until that
+is written).
+
+All values measured on hardware by shim/a51; see A51_PROGRESS.md for the boot
+log and the evidence for each one: framebuffer 0xca000000 1080x2400 stride 4320
+(dpp@0x14881000 IN_BASE_ADDR_Y), DECON_F 0x148b0000 in command mode, GICD
+0x12301000 / GICC 0x12302000 disabled at handoff, 26 MHz physical timer (INTID
+30), UFSHCI 2.1 at 0x13520000 with userdata at LBA 0x1f7500, and the log channel
+is the ramoops pmsg zone 0xf9e90000 -> /sys/fs/pstore/pmsg-ramoops-0.
 
 diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 --- a/pexpert/pexpert/arm64/A5XELTE.h
 +++ b/pexpert/pexpert/arm64/A5XELTE.h
-@@ -25,12 +25,41 @@ 
+@@ -25,12 +25,42 @@
  #define A5XELTE_VTIMER_INTID         27
  
  /*
 - * Samsung Galaxy S8 (SM-G950F, dreamlte, Exynos 8895) build of this port.
-+ * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611) build of this port.
-  * Same Samsung S-Boot handoff, GIC-400, 26 MHz timer and Cortex-A53 boot
-  * cluster as the A5; the board facts that differ are below.
-  */
+- * Same Samsung S-Boot handoff, GIC-400, 26 MHz timer and Cortex-A53 boot
+- * cluster as the A5; the board facts that differ are below.
+- */
 -#define DREAMLTE                      1
-+#define A51                           1
 -#if defined(DREAMLTE)
++ * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611) build of this port.
++ * Same Samsung S-Boot handoff, GIC-400, 26 MHz timer and Cortex-A53 boot
++ * cluster as the A5; the board facts that differ are below.
++ */
++#define A51                           1
 +#if defined(A51)
 +/*
 + * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611). Measured on hardware by
@@ -34,17 +50,18 @@ diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 + * DECON_F 0x148b0000 running in command mode (GLOBAL_CONTROL 0x113) and
 + * still scanning 0xca000000 through dpp@0x14881000 (IN_BASE_ADDR_Y, with
 + * SRC_SIZE/IMG_SIZE 0x09600438 = 2400x1080). The panel needs no DECON
-+ * programming to show framebuffer writes: 1151 FRAME_DONE events in 15 s.
++ * programming to show framebuffer writes: 1901 FRAME_DONE events in 25 s.
 + */
 +#define A5_FB_PHYS                    0xca000000  /* s3cfb.bootloaderfb, confirmed */
 +#define A5_FB_WIDTH                   1080
 +#define A5_FB_HEIGHT                  2400
 +#define A5_FB_STRIDE                  4320        /* bytes per row, XRGB8888 */
 +#define A5_FB_2M_BLOCKS               5           /* 1080*2400*4 = 10368000 */
++#define A5_DECON_PHYS                 0x148b0000  /* DECON_F, not the S8 0x12860000 */
 +#define A5_ENTRY_MARKER_PHYS          0xf9e9000c  /* pmsg zone data, see below */
 +#define A5_BOOT_MPIDR                 0x0         /* A53 little cluster boots */
-+#define A5_KEYS_DEFAULT               1           /* ALIVE GPIO5_15/6_15/7_15 */
-+#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100: no driver yet */
++#define A5_KEYS_DEFAULT               0           /* ALIVE is 0x11850000 on 9611, banks 5/6/7 pin 15; Phase 5 */
++#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100 on i2c 0x48: no driver yet */
 +#define A5_KLOG_PHYS                  0xf9e90000  /* ramoops PMSG zone, not the dump zone */
 +#define A5_KLOG_SIZE                  0x80000     /* pmsg_size = SZ_512K */
 +/* The live /timer node carries "use-physical-timer" like the S8, so arm the
@@ -60,14 +77,163 @@ diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -84,8 +84,8 @@ 
+@@ -84,8 +84,8 @@
  #define EXYNOS_UFS              1
  #define VS_UTRL_NEXUS_TYPE      0x40
  #define UFS_WLUN_DEVICE         0xd0
 -#define UFS_ADT_NODE            "/dreamlte-ufs"
-+#define UFS_ADT_NODE            "/a51-ufs"
 -#define UFS_DEFAULT_PART        "USERDATA"
++#define UFS_ADT_NODE            "/a51-ufs"
 +#define UFS_DEFAULT_PART        "userdata"
  #define PRDT_BYTES(field)       (field)
  #else
  #define UFS_ADT_NODE            "/sweet-ufs"
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1905,7 +1905,7 @@
+ #endif
+ 
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	uint64_t physmap_slide = 0;
+ #else
+ 	uint64_t physmap_slide = early_random() & ARM64_PHYSMAP_SLIDE_MASK & ~((uint64_t)PAGE_MASK);
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1913,7 +1913,7 @@
+ 	assert(physmap_slide < ARM64_PHYSMAP_SLIDE_RANGE);
+ 
+ 	physmap_base += physmap_slide;
+-#if defined(DREAMLTE) && !XNU_MONITOR
++#if (defined(DREAMLTE) || defined(A51)) && !XNU_MONITOR
+ 	physmap_base = ROUND_TWIG(physmap_base);
+ #endif
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2317,7 +2317,7 @@
+ 	va_l1 = dynamic_memory_begin;
+ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	va_l1_end += round_page((vm_size_t)A5_FB_STRIDE * A5_FB_HEIGHT) + (64ULL << 20);
+ #endif
+ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -721,7 +721,7 @@
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ /*
+  * Copy of the console in TWRP's ramoops pmsg zone, in persistent_ram
+  * format (sig "DBGC", start, size, ring data), appended to the loader's
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -814,7 +814,7 @@
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	klog_putc(c);
+ #endif
+ 	if (c == '\r') {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -896,7 +896,7 @@
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	klog_init();
+ #endif
+ 	sweet_early_mark(18, "fbcon mapping returned");
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,7 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #endif
+ 
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -296,7 +296,7 @@
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	{
+ 		/*
+ 		 * The entry is in the high RAM bank (0x88xxxxxxx); the loader probe
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -316,7 +316,10 @@
+ 	return v;
+ }
+ 
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
++#ifndef A5_DECON_PHYS
++#define A5_DECON_PHYS 0x12860000UL  /* S8 DECON_F */
++#endif
+ /*
+  * Boot 31 video: torn frames (top half of one screen, bottom of the
+  * next). DECON_F fetches the panel memory at 60 Hz (boot 30 probe: 30
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -332,7 +332,7 @@
+ sweet_fb_wait_frame_done(void)
+ {
+ 	if (sweet_fb_decon == 0) {
+-		sweet_fb_decon = ml_io_map(0x12860000, 0x1000);
++		sweet_fb_decon = ml_io_map(A5_DECON_PHYS, 0x1000);
+ 		if (sweet_fb_decon == 0) {
+ 			return;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -382,7 +382,7 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	IOLockLock(fPresentLock);
+-#if defined(DREAMLTE)
++#if (defined(DREAMLTE) || defined(A51))
+ 	sweet_fb_wait_frame_done();
+ #endif
+ 
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -18,7 +18,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ 
+-#if defined(DREAMLTE)
++#if defined(A51)
++#define A5_ALIVE_PA 0x11850000u            /* Exynos 9611 pinctrl ALIVE */
++#elif defined(DREAMLTE)
+ #define A5_ALIVE_PA 0x164b0000u            /* Exynos 8895 pinctrl ALIVE */
+ #else
+ #define A5_ALIVE_PA 0x139b0000u

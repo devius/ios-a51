@@ -1,15 +1,39 @@
 #!/usr/bin/env python3
-"""The A51 board layer, expressed once and used by both
-tools/a51/apply-a51.py (a tree already patched to 0124, no git needed) and
-tools/a51/mkpatch0125.py (which emits xnu/patches/0125-a51-exynos9611.patch).
+"""The A51 board layer, expressed once and consumed by both
+tools/a51/apply-a51.py (edits a working tree, no git needed) and
+tools/a51/mkpatch0125.py (emits xnu/patches/0125-a51-exynos9611.patch).
 
-Every value is measured, not guessed; the source is the boot-1 shim record in
-backup/live/boot6-dmesg-ramoops-0.txt plus backup/live/cmdline.txt and the live
-DTB in backup/live/fdt.dtb.
+Everything here is measured on the device, not inferred from the Samsung source
+tree; the evidence is the boot-1..8 shim reports in backup/live/ and
+A51_PROGRESS.md.
+
+Two kinds of edit:
+
+1. The board block in pexpert/pexpert/arm64/A5XELTE.h. 0124 turned every
+   hard-coded A5XELTE constant into an A5_* macro and put the S8 values in a
+   `#if defined(DREAMLTE)` branch; we insert an `#if defined(A51)` branch ahead
+   of it and flip the board selector, so the S8 stays readable and buildable.
+
+2. Guard extension. 0124 also wrapped its new code in `#if defined(DREAMLTE)`.
+   Some of that code is board-neutral and the A51 needs it verbatim (the ramoops
+   console copy, the framebuffer VA reservation, the deterministic physmap, the
+   CPU_ON trampoline for a high-bank entry). Some of it encodes S8 hardware and
+   must stay off (the MPIDR topology, the S6SY761 touch, the S8 logical display
+   size, the S8 DECON base). GUARD_SITES below lists, per file, exactly which
+   occurrences are extended; the ones left alone fall through to the existing
+   `#else`/A5XELTE path, which matches A51 hardware.
 """
 
-# pexpert/pexpert/arm64/A5XELTE.h: the A51 branch, inserted ahead of the
-# dreamlte branch so both boards stay readable in one file.
+HEADER_REL = 'pexpert/pexpert/arm64/A5XELTE.h'
+UFS_REL = 'bsd/dev/sweet_ufs.c'
+KEYS_REL = 'bsd/dev/a5xelte_keys.c'
+FB_REL = 'iokit/Kernel/arm/SweetFramebuffer.cpp'
+CPU_REL = 'iokit/Kernel/arm/SweetCPU.cpp'
+SERIAL_REL = 'pexpert/arm/pe_serial.c'
+VMINIT_REL = 'osfmk/arm64/arm_vm_init.c'
+
+# ---------------------------------------------------------------- board block
+
 A51_HEADER_BLOCK = [
     '/*',
     ' * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611). Measured on hardware by',
@@ -20,17 +44,18 @@ A51_HEADER_BLOCK = [
     ' * DECON_F 0x148b0000 running in command mode (GLOBAL_CONTROL 0x113) and',
     ' * still scanning 0xca000000 through dpp@0x14881000 (IN_BASE_ADDR_Y, with',
     ' * SRC_SIZE/IMG_SIZE 0x09600438 = 2400x1080). The panel needs no DECON',
-    ' * programming to show framebuffer writes: 1151 FRAME_DONE events in 15 s.',
+    ' * programming to show framebuffer writes: 1901 FRAME_DONE events in 25 s.',
     ' */',
     '#define A5_FB_PHYS                    0xca000000  /* s3cfb.bootloaderfb, confirmed */',
     '#define A5_FB_WIDTH                   1080',
     '#define A5_FB_HEIGHT                  2400',
     '#define A5_FB_STRIDE                  4320        /* bytes per row, XRGB8888 */',
     '#define A5_FB_2M_BLOCKS               5           /* 1080*2400*4 = 10368000 */',
+    '#define A5_DECON_PHYS                 0x148b0000  /* DECON_F, not the S8 0x12860000 */',
     '#define A5_ENTRY_MARKER_PHYS          0xf9e9000c  /* pmsg zone data, see below */',
     '#define A5_BOOT_MPIDR                 0x0         /* A53 little cluster boots */',
-    '#define A5_KEYS_DEFAULT               1           /* ALIVE GPIO5_15/6_15/7_15 */',
-    '#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100: no driver yet */',
+    '#define A5_KEYS_DEFAULT               0           /* ALIVE is 0x11850000 on 9611, banks 5/6/7 pin 15; Phase 5 */',
+    '#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100 on i2c 0x48: no driver yet */',
     '#define A5_KLOG_PHYS                  0xf9e90000  /* ramoops PMSG zone, not the dump zone */',
     '#define A5_KLOG_SIZE                  0x80000     /* pmsg_size = SZ_512K */',
     '/* The live /timer node carries "use-physical-timer" like the S8, so arm the',
@@ -41,7 +66,20 @@ A51_HEADER_BLOCK = [
     '#define A5XELTE_VTIMER_INTID         30',
 ]
 
-# The board selector line and the guard, as they read after 0124.
+# Why the pmsg zone and not the dump zone for the kernel console ring:
+# fs/pstore/ram.c only accepts a DMESG record whose data starts with the ASCII
+# header "====<sec>.<nsec>-D\n" (RAMOOPS_KERNMSG_HDR); ramoops_pstore_read()
+# calls persistent_ram_zap() on a record without one. pe_serial.c's klog writes
+# a bare persistent_ram ring (sig "DBGC", start, size, raw bytes), so in the dump
+# zone at 0xf9d10000 recovery would discard it. The PMSG zone has no header
+# requirement -- which is what the S8 port relied on (A5_KLOG_PHYS 0x92180000,
+# "TWRP ramoops pmsg zone"). Zone map on this device (lib/debug-snapshot-pstore.c
+# sizes, fs/pstore/ram.c order, log_pstore reg 0xf9d10000+0x200000):
+#   dump 0xf9d10000  console 0xf9d90000  ftrace 0xf9e10000  pmsg 0xf9e90000
+# The shim keeps its own report in the dump zone *with* a forged "====" header,
+# so shim output lands in dmesg-ramoops-0 and the kernel log in pmsg-ramoops-0
+# without either clobbering the other.
+
 DREAMLTE_COMMENT = (' * Samsung Galaxy S8 (SM-G950F, dreamlte, Exynos 8895) '
                     'build of this port.')
 A51_COMMENT = (' * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611) build of '
@@ -52,30 +90,11 @@ A51_SELECTOR = '#define A51                           1'
 A51_GUARD = '#if defined(A51)'
 A51_ELSE_GUARD = '#elif defined(DREAMLTE)'
 
-# Why the pmsg zone and not the dump zone for the kernel console ring:
-# fs/pstore/ram.c only accepts a DMESG record whose data starts with the ASCII
-# header "====<sec>.<nsec>-D\n" (RAMOOPS_KERNMSG_HDR); ramoops_pstore_read()
-# calls persistent_ram_zap() on a record without one. pe_serial.c's klog writes
-# a bare persistent_ram ring (sig "DBGC", start, size, raw bytes) with no such
-# header, so in the dump zone at 0xf9d10000 recovery would discard it. The PMSG
-# zone has no header requirement, which is exactly what the S8 port relied on
-# (A5_KLOG_PHYS 0x92180000 = "TWRP ramoops pmsg zone"). On this device the zones
-# are dump 0xf9d10000, console 0xf9d90000, ftrace 0xf9e10000, pmsg 0xf9e90000,
-# all SZ_512K (lib/debug-snapshot-pstore.c), so the kernel log goes to
-# 0xf9e90000 and shows up as /sys/fs/pstore/pmsg-ramoops-0.
-# The shim keeps its own report in the dump zone *with* a forged "====" header,
-# so shim output lands in dmesg-ramoops-0 and kernel output in pmsg-ramoops-0
-# without either one clobbering the other.
-
-# Single-line swaps shared by apply-a51.py and mkpatch0125.py so the two routes
-# cannot drift. The guard swap is separate because it inserts a whole block.
 HEADER_LINE_SUBSTITUTIONS = [
     (DREAMLTE_COMMENT, A51_COMMENT),
     (DREAMLTE_SELECTOR, A51_SELECTOR),
 ]
 
-# bsd/dev/sweet_ufs.c: the ADT node mkadt_a51.py creates, and the GPT name case
-# the A51 actually uses (by-name/userdata -> sda32; the S8 was upper case).
 UFS_SUBSTITUTIONS = [
     ('#define UFS_ADT_NODE            "/dreamlte-ufs"',
      '#define UFS_ADT_NODE            "/a51-ufs"'),
@@ -83,12 +102,61 @@ UFS_SUBSTITUTIONS = [
      '#define UFS_DEFAULT_PART        "userdata"'),
 ]
 
-HEADER_REL = 'pexpert/pexpert/arm64/A5XELTE.h'
-UFS_REL = 'bsd/dev/sweet_ufs.c'
+# ------------------------------------------------------- DREAMLTE guard sites
+# (rel, 1-based occurrence of a line starting with "#if defined(DREAMLTE)",
+#  replacement lines). Occurrences not listed keep the S8-only behaviour.
+GUARD = '#if defined(DREAMLTE)'
+BOTH = '#if (defined(DREAMLTE) || defined(A51))'
+
+GUARD_SITES = [
+    # Deterministic physmap (no slide) and thetwig rounding: the loader places
+    # the kernel in bank 1 and nothing else knows the slide.
+    (VMINIT_REL, 1, [BOTH]),
+    (VMINIT_REL, 2, ['#if (defined(DREAMLTE) || defined(A51)) && !XNU_MONITOR']),
+    # Reserve VA for the scanout buffer: A5_FB_STRIDE*A5_FB_HEIGHT + 64 MiB.
+    (VMINIT_REL, 3, [BOTH]),
+    # The ramoops console copy - our only readable kernel log on this device.
+    (SERIAL_REL, 1, [BOTH]),
+    (SERIAL_REL, 2, [BOTH]),
+    (SERIAL_REL, 3, [BOTH]),
+    # ml_io_map declaration, needed by the CPU_ON trampoline below.
+    (CPU_REL, 1, [BOTH]),
+    # CPU_REL occurrence 2 is the S8 MPIDR map (logical 0-3 = 0x100-0x103).
+    # A51 measured the opposite: A53 = MPIDR 0x0-0x3 boot cluster, A73 =
+    # 0x100-0x103, which is exactly the existing #else/A5XELTE branch. Leave it.
+    (CPU_REL, 3, [BOTH]),
+    # FB_REL occurrence 1 forces the iPhone-X logical size; the A5XELTE path
+    # (native 1080x2400) is what we want for the first boots. Leave it.
+    # Occurrence 2 is the frame-done wait: needed (DECON fetches at ~76 Hz while
+    # we copy), but with the A51 DECON base instead of the S8's.
+    (FB_REL, 2, [BOTH,
+                 '#ifndef A5_DECON_PHYS',
+                 '#define A5_DECON_PHYS 0x12860000UL  /* S8 DECON_F */',
+                 '#endif']),
+    (FB_REL, 3, [BOTH]),
+    # ALIVE pinctrl base: live DTB says /pinctrl@11850000 with gpa0/gpa1/gpa2
+    # and the key-power/key-volup/key-voldown states. Keys stay disabled
+    # (A5_KEYS_DEFAULT 0) until the bank/pin sampling is worked out.
+    (KEYS_REL, 1, ['#if defined(A51)',
+                   '#define A5_ALIVE_PA 0x11850000u            /* Exynos 9611 pinctrl ALIVE */',
+                   '#elif defined(DREAMLTE)']),
+]
+
+# Plain one-line substitutions inside a DREAMLTE-guarded body.
+LINE_EDITS = [
+    (FB_REL, 'sweet_fb_decon = ml_io_map(0x12860000, 0x1000);',
+     'sweet_fb_decon = ml_io_map(A5_DECON_PHYS, 0x1000);'),
+]
+
+EDITED_FILES = [HEADER_REL, UFS_REL, VMINIT_REL, SERIAL_REL, CPU_REL, FB_REL, KEYS_REL]
+
+
+def _extend_guard(line):
+    return line.replace('defined(DREAMLTE)', '(defined(DREAMLTE) || defined(A51))')
 
 
 def transformed_header(text):
-    """Return the A5XELTE.h text with the A51 branch inserted."""
+    """A5XELTE.h with the A51 branch inserted ahead of the dreamlte one."""
     for old, new in HEADER_LINE_SUBSTITUTIONS:
         if text.count(old) != 1:
             raise SystemExit(f'{HEADER_REL}: expected 1x {old!r}')
@@ -106,3 +174,55 @@ def transformed_ufs(text):
             raise SystemExit(f'{UFS_REL}: expected 1x {old!r}')
         text = text.replace(old, new)
     return text
+
+
+def transform_lines(rel, lines):
+    """Apply GUARD_SITES and LINE_EDITS for one file. lines have no newlines."""
+    lines = list(lines)
+
+    # Resolve every target index against the ORIGINAL text first: replacing a
+    # guard stops it from matching the pattern, which would shift the numbering
+    # of later occurrences. Then apply bottom-up so insertions stay valid.
+    guard_idxs = [i for i, l in enumerate(lines) if l.startswith(GUARD)]
+    pending = []
+    for target_rel, occ, replacement in GUARD_SITES:
+        if target_rel != rel:
+            continue
+        if len(guard_idxs) < occ:
+            raise SystemExit(f'{rel}: only {len(guard_idxs)} DREAMLTE guards, '
+                             f'wanted occurrence {occ}')
+        i = guard_idxs[occ - 1]
+        if replacement == [BOTH]:
+            pending.append((i, [_extend_guard(lines[i])]))
+        else:
+            pending.append((i, list(replacement)))
+    for i, replacement in sorted(pending, key=lambda p: -p[0]):
+        lines[i:i + 1] = replacement
+
+    for target_rel, old, new in LINE_EDITS:
+        if target_rel != rel:
+            continue
+        hits = [i for i, l in enumerate(lines) if l.strip() == old.strip()]
+        if len(hits) != 1:
+            raise SystemExit(f'{rel}: expected 1x {old!r}, found {len(hits)}')
+        indent = lines[hits[0]][:len(lines[hits[0]]) - len(lines[hits[0]].lstrip())]
+        lines[hits[0]] = indent + new
+
+    return lines
+
+
+def transformed_file(rel, text):
+    """Full transform for one source file (header/ufs handled separately)."""
+    if rel == HEADER_REL:
+        return transformed_header(text)
+    if rel == UFS_REL:
+        return transformed_ufs(text)
+    nl = '\r\n' if '\r\n' in text else '\n'
+    lines = text.split(nl)
+    trailing = lines[-1] == ''
+    if trailing:
+        lines = lines[:-1]
+    out = transform_lines(rel, lines)
+    if trailing:
+        out.append('')
+    return nl.join(out)
