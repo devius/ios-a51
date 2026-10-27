@@ -1,0 +1,73 @@
+Galaxy A51 (SM-A515F, Exynos 9611) board layer, on top of 0124.
+
+Board facts measured on hardware by shim/a51 and recorded in
+A51_PROGRESS.md: framebuffer 0xca000000 1080x2400 stride 4320
+(confirmed by dpp@0x14881000 IN_BASE_ADDR_Y and by the panel
+showing the shim paint), boot CPU MPIDR 0 (Cortex-A53), GICD
+0x12301000 / GICC 0x12302000 disabled at handoff, 26 MHz
+physical timer (INTID 30), UFSHCI 2.1 at 0x13520000, and the
+log channel is the ramoops dump zone at 0xf9d10000 which recovery
+exposes as /sys/fs/pstore/dmesg-ramoops-0.
+
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -25,12 +25,41 @@ 
+ #define A5XELTE_VTIMER_INTID         27
+ 
+ /*
+- * Samsung Galaxy S8 (SM-G950F, dreamlte, Exynos 8895) build of this port.
++ * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611) build of this port.
+  * Same Samsung S-Boot handoff, GIC-400, 26 MHz timer and Cortex-A53 boot
+  * cluster as the A5; the board facts that differ are below.
+  */
+-#define DREAMLTE                      1
++#define A51                           1
+-#if defined(DREAMLTE)
++#if defined(A51)
++/*
++ * Samsung Galaxy A51 (SM-A515F, a51, Exynos 9611). Measured on hardware by
++ * shim/a51 on 2026-10-27: S-Boot hands off at EL1 with the MMU off
++ * (SCTLR_EL1 0x30c5083a) on MPIDR 0 (Cortex-A53 little cluster), no EL2/EL3
++ * (ID_AA64PFR0_EL1 0x2222), 40-bit PA (ID_AA64MMFR0_EL1 0x1122), CNTFRQ_EL0
++ * already 26 MHz, GICD 0x12301000 present but disabled (GICD_CTLR 0),
++ * DECON_F 0x148b0000 running in command mode (GLOBAL_CONTROL 0x113) and
++ * still scanning 0xca000000 through dpp@0x14881000 (IN_BASE_ADDR_Y, with
++ * SRC_SIZE/IMG_SIZE 0x09600438 = 2400x1080). The panel needs no DECON
++ * programming to show framebuffer writes: 1151 FRAME_DONE events in 15 s.
++ */
++#define A5_FB_PHYS                    0xca000000  /* s3cfb.bootloaderfb, confirmed */
++#define A5_FB_WIDTH                   1080
++#define A5_FB_HEIGHT                  2400
++#define A5_FB_STRIDE                  4320        /* bytes per row, XRGB8888 */
++#define A5_FB_2M_BLOCKS               5           /* 1080*2400*4 = 10368000 */
++#define A5_ENTRY_MARKER_PHYS          0xf9e9000c  /* pmsg zone data, see below */
++#define A5_BOOT_MPIDR                 0x0         /* A53 little cluster boots */
++#define A5_KEYS_DEFAULT               1           /* ALIVE GPIO5_15/6_15/7_15 */
++#define A5_TOUCH_DEFAULT              0           /* Melfas MMS100: no driver yet */
++#define A5_KLOG_PHYS                  0xf9e90000  /* ramoops PMSG zone, not the dump zone */
++#define A5_KLOG_SIZE                  0x80000     /* pmsg_size = SZ_512K */
++/* The live /timer node carries "use-physical-timer" like the S8, so arm the
++ * non-secure physical timer: PPI 14 = INTID 30. a5xelte uses 27 (virtual)
++ * only because the Exynos7580 DT lacks that property. */
++#define A5_USE_PHYS_TIMER             1
++#undef A5XELTE_VTIMER_INTID
++#define A5XELTE_VTIMER_INTID         30
++#elif defined(DREAMLTE)
+ #define A5_FB_PHYS                    0xcc000000  /* s3cfb.bootloaderfb */
+ #define A5_FB_WIDTH                   1440
+ #define A5_FB_HEIGHT                  2960
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -84,8 +84,8 @@ 
+ #define EXYNOS_UFS              1
+ #define VS_UTRL_NEXUS_TYPE      0x40
+ #define UFS_WLUN_DEVICE         0xd0
+-#define UFS_ADT_NODE            "/dreamlte-ufs"
++#define UFS_ADT_NODE            "/a51-ufs"
+-#define UFS_DEFAULT_PART        "USERDATA"
++#define UFS_DEFAULT_PART        "userdata"
+ #define PRDT_BYTES(field)       (field)
+ #else
+ #define UFS_ADT_NODE            "/sweet-ufs"
