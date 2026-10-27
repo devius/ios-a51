@@ -237,3 +237,64 @@ diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
  #define A5_ALIVE_PA 0x164b0000u            /* Exynos 8895 pinctrl ALIVE */
  #else
  #define A5_ALIVE_PA 0x139b0000u
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,7 +12,13 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <pexpert/arm64/board_config.h>
++#if defined(A51)
++/* Galaxy A51: no fuel gauge driver yet (Phase 5). */
++static inline int sweet_spmi_init(void) { return -1; }
++static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
++#define SWEET_BAT_MAH 4000u
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /* Galaxy S8: MAX77865 fuel gauge (bsd/dev/a5xelte_touch.c). */
+ extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -216,7 +216,10 @@
+ void
+ SweetBattery::poll(void)
+ {
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(A51)
++	/* Unmeasured, like the S8 fallback: 100%, AC, not charging. */
++	publish(100, 4200, 0, true, true, false, true, false, false);
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	unsigned pct = 0, s8mv = 0;
+ 	int s8ma = 0, ext = 0, chg = 0, full = 0;
+ 	if (fReal && dreamlte_battery_read(&pct, &s8mv, &s8ma, &ext, &chg, &full) == 0) {
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -282,13 +282,17 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-	int real = 1;
+-#else
+-	int real = 0;
+-#endif
+-	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(A51)
++	int real = 0;
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
++	int real = 1;
++#else
++	int real = 0;
++#endif
++	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++#if defined(A51)
++	fReal = false;
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	fReal = real == 1;
+ #else
+ 	fReal = real == 1 && sweet_spmi_init() == 0;

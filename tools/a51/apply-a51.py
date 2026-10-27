@@ -62,3 +62,6 @@ for line in B.A51_HEADER_BLOCK:
 print('\nDREAMLTE guards extended for A51:')
 for rel, occ, _ in B.GUARD_SITES:
     print(f'  {rel}: occurrence {occ}')
+print('\nA5XELTE (S8 config) branches split for A51:')
+for rel, occ, _ in B.A5XELTE_GUARD_SITES:
+    print(f'  {rel}: occurrence {occ}')

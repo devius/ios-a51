@@ -22,6 +22,14 @@ Two kinds of edit:
    size, the S8 DECON base). GUARD_SITES below lists, per file, exactly which
    occurrences are extended; the ones left alone fall through to the existing
    `#else`/A5XELTE path, which matches A51 hardware.
+
+3. A5XELTE branch-out where the S8 body needs S8-only symbols. MACHINE_CONFIG
+   is still A5XELTE for the A51, so `#if defined(ARM64_BOARD_CONFIG_A5XELTE)`
+   selects S8 code. In iokit/Kernel/arm/SweetBattery.cpp that code calls
+   dreamlte_battery_read(), whose definition sits in bsd/dev/a5xelte_touch.c
+   under `#if defined(DREAMLTE)`; on the A51 that patch never defines it, which
+   is the undefined-symbol failure of run 40452629749. A5XELTE_GUARD_SITES puts
+   an `#if defined(A51)` branch ahead of the S8 one there.
 """
 
 HEADER_REL = 'pexpert/pexpert/arm64/A5XELTE.h'
@@ -29,6 +37,7 @@ UFS_REL = 'bsd/dev/sweet_ufs.c'
 KEYS_REL = 'bsd/dev/a5xelte_keys.c'
 FB_REL = 'iokit/Kernel/arm/SweetFramebuffer.cpp'
 CPU_REL = 'iokit/Kernel/arm/SweetCPU.cpp'
+BAT_REL = 'iokit/Kernel/arm/SweetBattery.cpp'
 SERIAL_REL = 'pexpert/arm/pe_serial.c'
 VMINIT_REL = 'osfmk/arm64/arm_vm_init.c'
 
@@ -142,13 +151,54 @@ GUARD_SITES = [
                    '#elif defined(DREAMLTE)']),
 ]
 
-# Plain one-line substitutions inside a DREAMLTE-guarded body.
+# ------------------------------------------- ARM64_BOARD_CONFIG_A5XELTE sites
+# Same idea as GUARD_SITES, for code that 0124 put under the S8 *config* guard.
+# The A51 builds with MACHINE_CONFIG=A5XELTE, so that guard is true on both
+# boards and an A51 branch has to come first.
+A5XELTE_GUARD = '#if defined(ARM64_BOARD_CONFIG_A5XELTE)'
+
+A5XELTE_GUARD_SITES = [
+    # SweetBattery.cpp occurrence 1: the declaration block. 0124 declared
+    # dreamlte_battery_read (S8 MAX77865, defined in a5xelte_touch.c only under
+    # DREAMLTE) and stubbed sweet_spmi away. The A51 has no fuel gauge yet --
+    # the Melfas MMS100 and the 4000 mAh pack are Phase 5 -- so it declares no
+    # gauge function and keeps the SPMI stubs, but with its own capacity.
+    (BAT_REL, 1, ['#if defined(A51)',
+                  '/* Galaxy A51: no fuel gauge driver yet (Phase 5). */',
+                  'static inline int sweet_spmi_init(void) { return -1; }',
+                  'static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }',
+                  '#define SWEET_BAT_MAH 4000u',
+                  '#elif defined(ARM64_BOARD_CONFIG_A5XELTE)']),
+    # poll(): publish the very same unmeasured AC default the S8 branch falls
+    # back to, without reading a PMIC or gauge register.
+    (BAT_REL, 2, ['#if defined(A51)',
+                  '\t/* Unmeasured, like the S8 fallback: 100%, AC, not charging. */',
+                  '\tpublish(100, 4200, 0, true, true, false, true, false, false);',
+                  '#elif defined(ARM64_BOARD_CONFIG_A5XELTE)']),
+    # start(): without a gauge there is nothing to poll, so never arm the 30 s
+    # timer and never set fReal (a sweetbattery=1 boot arg stays inert).
+    (BAT_REL, 3, ['#if defined(A51)',
+                  '\tint real = 0;',
+                  '#elif defined(ARM64_BOARD_CONFIG_A5XELTE)']),
+    (BAT_REL, 4, ['#if defined(A51)',
+                  '\tfReal = false;',
+                  '#elif defined(ARM64_BOARD_CONFIG_A5XELTE)']),
+]
+
+# Plain substitutions inside a DREAMLTE-guarded body: (rel, old, new), where new
+# is either one line or a list of lines that replace the old one.
 LINE_EDITS = [
     (FB_REL, 'sweet_fb_decon = ml_io_map(0x12860000, 0x1000);',
      'sweet_fb_decon = ml_io_map(A5_DECON_PHYS, 0x1000);'),
+    # A51 is defined in this header. SweetBattery.cpp keyed only off the
+    # ARM64_BOARD_CONFIG_* -D flags and never included it.
+    (BAT_REL, '#include <pexpert/pexpert.h>',
+     ['#include <pexpert/pexpert.h>',
+      '#include <pexpert/arm64/board_config.h>']),
 ]
 
-EDITED_FILES = [HEADER_REL, UFS_REL, VMINIT_REL, SERIAL_REL, CPU_REL, FB_REL, KEYS_REL]
+EDITED_FILES = [HEADER_REL, UFS_REL, VMINIT_REL, SERIAL_REL, CPU_REL, FB_REL,
+                KEYS_REL, BAT_REL]
 
 
 def _extend_guard(line):
@@ -177,27 +227,16 @@ def transformed_ufs(text):
 
 
 def transform_lines(rel, lines):
-    """Apply GUARD_SITES and LINE_EDITS for one file. lines have no newlines."""
+    """Apply GUARD_SITES, A5XELTE_GUARD_SITES and LINE_EDITS for one file.
+
+    lines have no newlines."""
     lines = list(lines)
 
     # Resolve every target index against the ORIGINAL text first: replacing a
     # guard stops it from matching the pattern, which would shift the numbering
     # of later occurrences. Then apply bottom-up so insertions stay valid.
-    guard_idxs = [i for i, l in enumerate(lines) if l.startswith(GUARD)]
-    pending = []
-    for target_rel, occ, replacement in GUARD_SITES:
-        if target_rel != rel:
-            continue
-        if len(guard_idxs) < occ:
-            raise SystemExit(f'{rel}: only {len(guard_idxs)} DREAMLTE guards, '
-                             f'wanted occurrence {occ}')
-        i = guard_idxs[occ - 1]
-        if replacement == [BOTH]:
-            pending.append((i, [_extend_guard(lines[i])]))
-        else:
-            pending.append((i, list(replacement)))
-    for i, replacement in sorted(pending, key=lambda p: -p[0]):
-        lines[i:i + 1] = replacement
+    lines = _apply_sites(rel, lines, GUARD, GUARD_SITES)
+    lines = _apply_sites(rel, lines, A5XELTE_GUARD, A5XELTE_GUARD_SITES)
 
     for target_rel, old, new in LINE_EDITS:
         if target_rel != rel:
@@ -206,8 +245,31 @@ def transform_lines(rel, lines):
         if len(hits) != 1:
             raise SystemExit(f'{rel}: expected 1x {old!r}, found {len(hits)}')
         indent = lines[hits[0]][:len(lines[hits[0]]) - len(lines[hits[0]].lstrip())]
-        lines[hits[0]] = indent + new
+        replacement = [new] if isinstance(new, str) else list(new)
+        lines[hits[0]:hits[0] + 1] = [indent + l if k == 0 else l
+                                      for k, l in enumerate(replacement)]
 
+    return lines
+
+
+def _apply_sites(rel, lines, pattern, sites):
+    """Replace the Nth line starting with pattern with a list of lines."""
+    lines = list(lines)
+    idxs = [i for i, l in enumerate(lines) if l.startswith(pattern)]
+    pending = []
+    for target_rel, occ, replacement in sites:
+        if target_rel != rel:
+            continue
+        if len(idxs) < occ:
+            raise SystemExit(f'{rel}: only {len(idxs)} {pattern!r} guards, '
+                             f'wanted occurrence {occ}')
+        i = idxs[occ - 1]
+        if replacement == [BOTH]:
+            pending.append((i, [_extend_guard(lines[i])]))
+        else:
+            pending.append((i, list(replacement)))
+    for i, replacement in sorted(pending, key=lambda p: -p[0]):
+        lines[i:i + 1] = replacement
     return lines
 
 
