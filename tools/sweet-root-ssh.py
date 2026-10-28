@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add an SSH server (OpenSSH) and a shell to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-ssh.py MOUNTED_ROOT JB_TREE AUTHORIZED_KEY.pub HOSTKEY_DIR
+  sudo sweet-root-ssh.py [--diag] MOUNTED_ROOT JB_TREE AUTHORIZED_KEY.pub HOSTKEY_DIR
 
 JB_TREE holds var/jb/... made by tools/procursus-tree.py from Procursus iOS 16
 (dists/1900, iphoneos-arm64) packages: openssh-server, bash, coreutils and
@@ -11,7 +11,8 @@ HOSTKEY_DIR holds ssh_host_{ed25519,ecdsa,rsa}_key(.pub), made on the PC with
 ssh-keygen, so the host key does not change between reinstalls.
 
   /private/var/jb          the tree, root-owned; host keys in etc/ssh
-  launchd.plist            job com.sweet.sshd: sshd -D on port 22, no PAM, no
+  launchd.plist            job com.sweet.sshd: sweet-sshd builds the user
+                           database, then sshd -D on port 22, no PAM, no
                            StrictModes (the real path of ~root/.ssh runs
                            through /private, made on Linux; a key login was
                            refused with them), log in /var/jb/var/log/sshd.log
@@ -19,18 +20,22 @@ ssh-keygen, so the host key does not change between reinstalls.
                            earlier com.sweet.dropbear job is removed
                            (Procursus' dropbear needs libtomcrypt1, which
                            the 1900 index lacks)
-                           job com.sweet.sshdiag: once the USB link is up,
-                           sends SSHDIAG lines to the PC's live log (udp/5140
-                           on 192.168.7.1, bash's /dev/udp): root's account
-                           as getpwnam sees it, sshd -T, sshd.log, then runs
-                           sshd -d on port 2222 (debug: says why a login is
-                           refused). getpwnam fails for every user on this
-                           port ("id root": no such user); sshd gets
-                           XBS_DISABLE_LIBINFO=YES, Libinfo's switch that
-                           skips the usermanagerd source.
-                           Keys as qemu-t8030's bash job
+                           with --diag, job com.sweet.sshdiag: once the USB
+                           link is up, sends SSHDIAG lines to the PC's live
+                           log (udp/5140 on 192.168.7.1, bash's /dev/udp):
+                           accounts, user database, sshd -T, sshd.log, then
+                           runs sshd -d on port 2222 (says why a login is
+                           refused). Keys as qemu-t8030's bash job
                            (POSIXSpawnType Interactive, no pressured exit);
-                           com.sweet.sshlog (no spawn type) never started
+                           a job without POSIXSpawnType never started.
+                           Without --diag the job is removed.
+  /var/jb/etc              master.passwd, passwd, group, shells: Procursus
+                           binaries resolve users with libiosexec
+                           (ie_getpwnam), which reads only
+                           /var/jb/etc/{spwd.db,pwd.db,group}, never /etc;
+                           without them root is an invalid user and every
+                           login is refused. sweet-sshd makes the .db files
+                           with pwd_mkdb at each start
   passwd                   "sshd" (uid 75, as iOS's _sshd): sshd's privilege
                            separation user
   root                     shell /var/jb/bin/bash, listed in /etc/shells;
@@ -111,7 +116,7 @@ PRIVSEP = {'master.passwd': 'sshd:*:75:75::0:0:sshd Privilege separation:/var/jb
            'passwd': 'sshd:*:75:75:sshd Privilege separation:/var/jb/var/empty:/usr/bin/false'}
 
 
-def install_tree(root, tree, hostkeys):
+def install_tree(root, tree, hostkeys, diag):
     src = os.path.join(tree, 'var/jb')
     dst = os.path.join(root, 'private/var/jb')
     # all of it comes from JB_TREE: replace it (copytree cannot overwrite symlinks)
@@ -130,7 +135,7 @@ def install_tree(root, tree, hostkeys):
             os.chmod(os.path.join(ssh, n), 0o600)
     os.chmod(os.path.join(dst, 'var/empty'), 0o755)
     os.makedirs(os.path.join(dst, 'var/log'), exist_ok=True)
-    for path, text in ((DIAG, DIAG_SCRIPT), (WRAPPER, WRAPPER_SCRIPT)):
+    for path, text in ((DIAG, DIAG_SCRIPT),) * diag + ((WRAPPER, WRAPPER_SCRIPT),):
         path = os.path.join(root, path.lstrip('/').replace('var/jb', 'private/var/jb', 1))
         with open(path, 'w') as f:
             f.write(text)
@@ -139,7 +144,7 @@ def install_tree(root, tree, hostkeys):
     print('installed', dst)
 
 
-def launchd(root):
+def launchd(root, diag):
     path = os.path.join(root, LAUNCHD)
     st = os.stat(path)
     with open(path, 'rb') as f:
@@ -159,20 +164,22 @@ def launchd(root):
         'POSIXSpawnType': 'Interactive',
     }
     jobs.pop(LOG_JOB, None)
-    jobs[DIAG_JOB] = {
-        'Label': 'com.sweet.sshdiag',
-        'ProgramArguments': ['/var/jb/usr/bin/bash', DIAG],
-        'UserName': 'root',
-        'RunAtLoad': True,
-        'KeepAlive': True,
-        'POSIXSpawnType': 'Interactive',
-        'EnablePressuredExit': False,
-    }
+    jobs.pop(DIAG_JOB, None)
+    if diag:
+        jobs[DIAG_JOB] = {
+            'Label': 'com.sweet.sshdiag',
+            'ProgramArguments': ['/var/jb/usr/bin/bash', DIAG],
+            'UserName': 'root',
+            'RunAtLoad': True,
+            'KeepAlive': True,
+            'POSIXSpawnType': 'Interactive',
+            'EnablePressuredExit': False,
+        }
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(path, st.st_uid, st.st_gid)
     os.chmod(path, st.st_mode & 0o7777)
-    print('launchd.plist: jobs com.sweet.sshd, com.sweet.sshdiag')
+    print('launchd.plist: job com.sweet.sshd' + ', com.sweet.sshdiag' * diag)
 
 
 def bin_sh(root):
@@ -232,11 +239,15 @@ def authorized_key(root, key):
 
 
 def main():
-    if len(sys.argv) != 5 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    diag = '--diag' in args
+    if diag:
+        args.remove('--diag')
+    if len(args) != 4 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root, tree, key, hostkeys = sys.argv[1:]
-    install_tree(root, tree, hostkeys)
-    launchd(root)
+    root, tree, key, hostkeys = args
+    install_tree(root, tree, hostkeys, diag)
+    launchd(root, diag)
     accounts(root)
     bin_sh(root)
     authorized_key(root, key)
