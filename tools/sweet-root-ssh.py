@@ -19,9 +19,14 @@ ssh-keygen, so the host key does not change between reinstalls.
                            earlier com.sweet.dropbear job is removed
                            (Procursus' dropbear needs libtomcrypt1, which
                            the 1900 index lacks)
-                           job com.sweet.sshlog: bash sends new lines of
-                           sshd.log to the PC's live log (udp/5140 on
-                           192.168.7.1, bash's /dev/udp)
+                           job com.sweet.sshdiag: once the USB link is up,
+                           sends SSHDIAG lines to the PC's live log (udp/5140
+                           on 192.168.7.1, bash's /dev/udp): root's account
+                           as getpwnam sees it, sshd -T, sshd.log, then runs
+                           sshd -d on port 2222 (debug: says why a login is
+                           refused). Keys as qemu-t8030's bash job
+                           (POSIXSpawnType Interactive, no pressured exit);
+                           com.sweet.sshlog (no spawn type) never started
   passwd                   "sshd" (uid 75, as iOS's _sshd): sshd's privilege
                            separation user
   root                     shell /var/jb/bin/bash, listed in /etc/shells;
@@ -40,6 +45,26 @@ LAUNCHD = 'System/Library/xpc/launchd.plist'
 JOB = '/System/Library/LaunchDaemons/com.sweet.sshd.plist'
 OLD_JOB = '/System/Library/LaunchDaemons/com.sweet.dropbear.plist'
 LOG_JOB = '/System/Library/LaunchDaemons/com.sweet.sshlog.plist'
+DIAG_JOB = '/System/Library/LaunchDaemons/com.sweet.sshdiag.plist'
+DIAG = '/var/jb/usr/libexec/sweet-sshdiag'
+DIAG_SCRIPT = r'''#!/var/jb/usr/bin/bash
+# com.sweet.sshdiag: SSH diagnostics to the PC's live log (tools/sweet-root-ssh.py)
+export PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+udp=/dev/udp/192.168.7.1/5140
+for i in $(seq 120); do echo "SSHDIAG start" 2>/dev/null >$udp && break; sleep 2; done
+exec >$udp 2>&1
+tag() { while IFS= read -r l; do echo "SSHDIAG $1 $l"; done; }
+{ id; id root; who am i; ls -lnd / /bin /bin/sh /private /private/var /private/var/root \
+	/private/var/root/.ssh /private/var/root/.ssh/authorized_keys /var/jb/bin/bash \
+	/var/jb/var/empty /var/jb/var/log; ls -ln /var/jb/var/log; cat /etc/shells; } 2>&1 | tag sys
+grep -E '^(root|sshd|_sshd):' /etc/master.passwd /etc/passwd 2>&1 | tag pw
+sshd -T -o UsePAM=no -o StrictModes=no 2>&1 | grep -iE 'permitroot|pubkey|password|authorizedkeys|strict|usepam|usedns|allowusers|denyusers' | tag cfg
+cat /var/jb/var/log/sshd.log /var/jb/var/log/sshd.out 2>&1 | tail -n 30 | tag log
+while true; do
+	sshd -d -D -p 2222 -o UsePAM=no -o StrictModes=no -o LogLevel=DEBUG2 2>&1 | tag dbg
+	sleep 2
+done
+'''
 SHELL = '/var/jb/bin/bash'
 PRIVSEP = {'master.passwd': 'sshd:*:75:75::0:0:sshd Privilege separation:/var/jb/var/empty:/usr/bin/false',
            'passwd': 'sshd:*:75:75:sshd Privilege separation:/var/jb/var/empty:/usr/bin/false'}
@@ -64,6 +89,11 @@ def install_tree(root, tree, hostkeys):
             os.chmod(os.path.join(ssh, n), 0o600)
     os.chmod(os.path.join(dst, 'var/empty'), 0o755)
     os.makedirs(os.path.join(dst, 'var/log'), exist_ok=True)
+    diag = os.path.join(root, DIAG.lstrip('/').replace('var/jb', 'private/var/jb', 1))
+    with open(diag, 'w') as f:
+        f.write(DIAG_SCRIPT)
+    os.chown(diag, 0, 0)
+    os.chmod(diag, 0o755)
     print('installed', dst)
 
 
@@ -86,21 +116,21 @@ def launchd(root):
         'KeepAlive': True,
         'POSIXSpawnType': 'Interactive',
     }
-    # tail exits when a send fails (USB link not up yet); launchd restarts it
-    jobs[LOG_JOB] = {
-        'Label': 'com.sweet.sshlog',
-        'ProgramArguments': [SHELL, '-c', 'exec /var/jb/usr/bin/tail -n 40 -F /var/jb/var/log/sshd.log '
-                                          '> /dev/udp/192.168.7.1/5140'],
+    jobs.pop(LOG_JOB, None)
+    jobs[DIAG_JOB] = {
+        'Label': 'com.sweet.sshdiag',
+        'ProgramArguments': ['/var/jb/usr/bin/bash', DIAG],
         'UserName': 'root',
         'RunAtLoad': True,
         'KeepAlive': True,
-        'ThrottleInterval': 15,
+        'POSIXSpawnType': 'Interactive',
+        'EnablePressuredExit': False,
     }
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(path, st.st_uid, st.st_gid)
     os.chmod(path, st.st_mode & 0o7777)
-    print('launchd.plist: jobs com.sweet.sshd, com.sweet.sshlog')
+    print('launchd.plist: jobs com.sweet.sshd, com.sweet.sshdiag')
 
 
 def bin_sh(root):
