@@ -937,3 +937,11 @@ far away. At this size the time is per-frame overhead (synchronous submit,
 glFinish, two console lines per frame with a51gpulog=1), not GPU work.
 Note: loader-15min's dead-man timer also resets a *healthy* boot into TWRP
 after 15 minutes.
+
+### Loader with a 60-minute dead-man (GPU sub-project 3, 2026-10-29)
+
+`build/loader-60min.bin` (sha256 prefix in the commit): `shim/a51` at its
+committed state, `CROSS=aarch64-linux-gnu- EXTRA_CFLAGS="-DDEADMAN_MS=3600000UL
+-DDEADMAN_MPIDR=0x103UL"`. A 15-minute twin differs in 5 bytes (the deadline
+immediate). Panics now reset into TWRP themselves (0143), so the dead-man only
+guards hard hangs, and UI sessions get an hour.
