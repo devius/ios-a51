@@ -65,18 +65,22 @@ def cpu_node(logical):
     """A51 is little-first: CPU0-3 are Cortex-A53, CPU4-7 Cortex-A73."""
     a53 = logical < 4
     mpidr = logical if a53 else 0x100 + (logical - 4)
-    cluster = 0 if a53 else 1
+    # One cluster for all eight cores (patch 0129): the A73s as cluster 1 give
+    # XNU a second pset, which this non-AMP scheduler cannot handle.
+    cluster = 0
     return [
         ('device_type', mkadt.cstr('cpu')),
-        ('compatible', mkadt.cstr('arm,cortex-a53' if a53 else 'arm,cortex-a73') +
+        # SweetCPU matches 'arm,cortex-a53' (IONameMatch); the A73s list it too.
+        ('compatible', (mkadt.cstr('arm,cortex-a53') if a53 else
+                        mkadt.cstr('arm,cortex-a73') + mkadt.cstr('arm,cortex-a53')) +
          mkadt.cstr('ARM,v8')),
         ('reg', mkadt.u32(mpidr)),
         ('cpu-id', mkadt.u32(logical)),
         ('cluster-id', mkadt.u32(cluster)),
         ('cluster-type', mkadt.u32(0)),
         ('die-cluster-id', mkadt.u32(cluster)),
-        ('cluster-core-id', mkadt.u32(logical % 4)),
-        ('l2-cache-id', mkadt.u32(cluster)),
+        ('cluster-core-id', mkadt.u32(logical)),
+        ('l2-cache-id', mkadt.u32(0 if a53 else 1)),
         ('l3-cache-id', mkadt.u32(0)),
         ('state', mkadt.cstr('running' if logical == 0 else 'stopped')),
         ('timebase-frequency', mkadt.u32(TIMEBASE)),
