@@ -42,7 +42,7 @@ cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
 cp build.log out/
 k=out/kernel.development.a5xelte
 if [[ -f $k ]]; then
-	(cd out && shasum -a 256 kernel.* > SHA256SUMS)
+	(cd out && shasum -a 256 kernel.development.a5xelte > SHA256SUMS)
 	lse=$(xcrun llvm-objdump -d --no-show-raw-insn "$k" | grep -cE '	(cas|casa|casal|casl|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*	' || true)
 	echo "kernel: $(ls -l "$k" | awk '{print $5}') bytes, LSE instructions: $lse"
 else

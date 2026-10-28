@@ -1,0 +1,89 @@
+A51 GPU: map the GPU region in two small pieces (boot 40 panic).
+
+Boot 40 (a51gpu=3) printed the probe line (GPU_ID 0x62210010, 3 cores,
+AS 0xff, JS 0x7, MMU 0x2830, not coherent; as the loader measured) and then
+panicked in the bring-up: kmem_alloc(..., 8388608, 0x100021): failed with 3
+(KERN_NO_SPACE), i.e. ml_io_map() of the 8 MiB GPU region, which may not
+fail. The CPU now maps only what it writes: 128 KiB (page tables with the
+user L2 moved to +0x5000, test pages) and the 2 MiB of user L3 tables, the
+size the S7 mapped. The scratch block stays GPU-only. (The panic then hung
+on "handshake structure not initialized" instead of rebooting; the shim's
+dead-man timer reset the phone into TWRP 15 min later.)
+
+diff --git i/bsd/dev/a51_gpu.c w/bsd/dev/a51_gpu.c
+index a5590e8..4257607 100644
+--- i/bsd/dev/a51_gpu.c
++++ w/bsd/dev/a51_gpu.c
+@@ -22,7 +22,10 @@
+  * 0x40000000..0x7fffffff. The tables, test pages and scratch block live in
+  * a 64 MiB region at 0x8e0000000 in bank 1, outside XNU's RAM
+  * (0x880000000..0x8a0000000). The user range has one fixed L3 table per
+- * 2 MiB, so tables are never exhausted. The rest of HeroGPU's interface
++ * 2 MiB, so tables are never exhausted. The CPU maps only what it writes:
++ * 128 KiB (tables, test pages) and the 2 MiB of user L3 tables; one 8 MiB
++ * ml_io_map panicked (boot 40: kmem_alloc KERN_NO_SPACE). The scratch block
++ * is only in the GPU's tables. The rest of HeroGPU's interface
+  * (herolte_gpu_*) is exported unchanged for iokit/Kernel/arm/HeroGPU.cpp.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -118,7 +121,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ 
+ /* The GPU region (bank 1, outside XNU's RAM) and what lives in it. */
+ #define A51_REGION_PA           0x8e0000000ull
+-#define A51_REGION_MAPPED       0x800000u       /* of 64 MiB */
++#define A51_LOW_MAPPED          0x20000u        /* CPU mapping 1: +0..+128 KiB */
+ #define R_L0                    0x0000u
+ #define R_L1                    0x1000u
+ #define R_L2_LOW                0x2000u         /* VA 0..1 GiB */
+@@ -127,15 +130,16 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ #define R_TEST                  0x10000u        /* 16 pages at A51_TEST_VA */
+ #define R_TEST_PAGES            16u
+ #define R_SCRATCH               0x200000u       /* 2 MiB at A51_SCRATCH_VA */
+-#define R_L2_USER               0x400000u       /* VA 1..2 GiB */
+-#define R_L3_USER               0x401000u       /* 512 tables, one per 2 MiB */
++#define R_L2_USER               0x5000u         /* VA 1..2 GiB */
++#define R_L3_USER               0x400000u       /* CPU mapping 2: 512 tables, one per 2 MiB */
++#define R_L3_USER_BYTES         0x200000u
+ #define A51_TEST_VA             0x02000000ull
+ #define A51_SCRATCH_VA          0x0a000000ull
+ #define A51_USER_VA             0x40000000ull
+ #define A51_USER_BYTES          0x40000000ull
+ #define A51_OUT_OFF             0x100u
+ 
+-static vm_offset_t a51_pmu, a51_gpu_base, a51_region;
++static vm_offset_t a51_pmu, a51_gpu_base, a51_region, a51_user_tables;
+ static int a51_gpu_mode = 1, a51_gpu_pretend_off, a51_gpu_log;
+ static int a51_gpu_sleep;
+ static int a51_gpu_state;               /* 0 not tried, 1 up, -1 failed */
+@@ -238,6 +242,9 @@ a51_zero(vm_offset_t va, size_t bytes)
+ static volatile uint64_t *
+ a51_table(uint32_t off)
+ {
++	if (off >= R_L3_USER) {
++		return (volatile uint64_t *)(a51_user_tables + (off - R_L3_USER));
++	}
+ 	return (volatile uint64_t *)(a51_region + off);
+ }
+ 
+@@ -246,7 +253,8 @@ a51_table(uint32_t off)
+ static void
+ a51_gpu_tables(void)
+ {
+-	a51_zero(a51_region, R_L3_USER + 512 * 0x1000);
++	a51_zero(a51_region, A51_LOW_MAPPED);
++	a51_zero(a51_user_tables, R_L3_USER_BYTES);
+ 	a51_table(R_L0)[a51_pt_index(0, 0)] = a51_pte_table(A51_REGION_PA + R_L1);
+ 	a51_table(R_L1)[a51_pt_index(0, 1)] = a51_pte_table(A51_REGION_PA + R_L2_LOW);
+ 	a51_table(R_L1)[a51_pt_index(A51_USER_VA, 1)] = a51_pte_table(A51_REGION_PA + R_L2_USER);
+@@ -398,8 +406,9 @@ a51_gpu_bringup(void)
+ 	if (!a51_gpu_base) {
+ 		a51_gpu_base = ml_io_map(A51_GPU_PA, A51_GPU_BYTES);
+ 	}
+-	a51_region = ml_io_map((vm_offset_t)A51_REGION_PA, A51_REGION_MAPPED);
+-	if (!a51_gpu_base || !a51_region) {
++	a51_region = ml_io_map((vm_offset_t)A51_REGION_PA, A51_LOW_MAPPED);
++	a51_user_tables = ml_io_map((vm_offset_t)(A51_REGION_PA + R_L3_USER), R_L3_USER_BYTES);
++	if (!a51_gpu_base || !a51_region || !a51_user_tables) {
+ 		printf("A51 GPU: bring-up: mapping failed\n");
+ 		return false;
+ 	}
