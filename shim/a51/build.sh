@@ -21,8 +21,10 @@ $CC $CFLAGS -c ufs_probe.c -o out/ufs_probe.o
 $CC $CFLAGS -c payload_boot.c -o out/payload_boot.o
 $CC $CFLAGS -c ../fdt.c -o out/fdt.o
 $CC $CFLAGS -c deadman.S -o out/deadman.o
+$CC $CFLAGS -c muic.c -o out/muic.o
+$CC $CFLAGS -c pmic.c -o out/pmic.o
 
-OBJS="out/start.o out/main.o out/ufs_probe.o out/payload_boot.o out/fdt.o out/deadman.o"
+OBJS="out/start.o out/main.o out/ufs_probe.o out/payload_boot.o out/fdt.o out/deadman.o out/muic.o out/pmic.o"
 abs=$($READELF -r $OBJS | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations" >&2; exit 1; }
 

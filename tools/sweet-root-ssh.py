@@ -11,8 +11,11 @@ HOSTKEY_DIR holds ssh_host_{ed25519,ecdsa,rsa}_key(.pub), made on the PC with
 ssh-keygen, so the host key does not change between reinstalls.
 
   /private/var/jb          the tree, root-owned; host keys in etc/ssh
-  launchd.plist            job com.sweet.sshd: sshd -D -e on port 22, no PAM,
-                           errors to /dev/console (the live log); the
+  launchd.plist            job com.sweet.sshd: sshd -D on port 22, no PAM, no
+                           StrictModes (the real path of ~root/.ssh runs
+                           through /private, made on Linux; a key login was
+                           refused with them), log in /var/jb/var/log/sshd.log
+                           (/dev/console does not reach the UDP log); the
                            earlier com.sweet.dropbear job is removed
                            (Procursus' dropbear needs libtomcrypt1, which
                            the 1900 index lacks)
@@ -52,6 +55,7 @@ def install_tree(root, tree, hostkeys):
         if n.startswith('ssh_host_') and n.endswith('_key'):
             os.chmod(os.path.join(ssh, n), 0o600)
     os.chmod(os.path.join(dst, 'var/empty'), 0o755)
+    os.makedirs(os.path.join(dst, 'var/log'), exist_ok=True)
     print('installed', dst)
 
 
@@ -64,10 +68,11 @@ def launchd(root):
     jobs.pop(OLD_JOB, None)
     jobs[JOB] = {
         'Label': 'com.sweet.sshd',
-        'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e', '-o', 'UsePAM=no'],
+        'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-o', 'UsePAM=no', '-o', 'StrictModes=no',
+                             '-o', 'LogLevel=VERBOSE', '-E', '/var/jb/var/log/sshd.log'],
         'EnvironmentVariables': {'PATH': '/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin'},
-        'StandardOutPath': '/dev/console',
-        'StandardErrorPath': '/dev/console',
+        'StandardOutPath': '/var/jb/var/log/sshd.out',
+        'StandardErrorPath': '/var/jb/var/log/sshd.out',
         'UserName': 'root',
         'RunAtLoad': True,
         'KeepAlive': True,

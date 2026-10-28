@@ -28,8 +28,15 @@ deadman_entry:
     adr x9, deadman_alive
     str x0, [x9, #56]
     ldr x19, deadman_deadline_cell
+    /* Coherency controls of this core, read through deadman_probe's trap
+     * catcher (EL3 may not grant EL1 access): CPUECTLR, CPUACTLR + ESRs. */
+    add x0, x9, #64
+    bl deadman_probe
+    bl cpu_mhz
+    str x0, [x9, #96]            /* alive[12]: this core's MHz */
     /* Proof of life for the boot CPU (MMU off on both sides, so plain
-     * stores are visible): magic, CurrentEL, CNTPCT, SCTLR, MPIDR. */
+     * stores are visible): magic, CurrentEL, CNTPCT, SCTLR, MPIDR. The
+     * magic is stored last, so it also means every field above is valid. */
     mrs x10, CurrentEL
     mrs x11, cntpct_el0
     mrs x12, sctlr_el1
@@ -72,11 +79,80 @@ deadman_entry:
 2:  wfe
     b 2b
 
+/* uint64_t cpu_mhz(void): this core's clock, from PMCCNTR over 10 ms of the
+ * 26 MHz system counter. Clobbers x1-x5. */
+.global cpu_mhz
+cpu_mhz:
+    mov x1, #1                   /* PMCR_EL0.E */
+    orr x1, x1, #4               /* .C: reset the cycle counter */
+    msr pmcr_el0, x1
+    mov x1, #(1 << 31)
+    msr pmcntenset_el0, x1       /* enable PMCCNTR */
+    isb
+    mrs x2, cntpct_el0
+    mrs x3, pmccntr_el0
+    movz x4, #0xf7a0             /* 260000 ticks = 10 ms */
+    movk x4, #0x3, lsl #16
+1:  isb
+    mrs x5, cntpct_el0
+    sub x5, x5, x2
+    cmp x5, x4
+    b.lo 1b
+    mrs x1, pmccntr_el0
+    sub x0, x1, x3
+    mov x1, #10000
+    udiv x0, x0, x1              /* cycles per 10 ms / 10000 = MHz */
+    ret
+
+/* void deadman_probe(uint64_t out[4]): out = { CPUECTLR_EL1, ESR if that
+ * read trapped (else 0), CPUACTLR_EL1, ESR }. A trapping read goes to
+ * deadman_vectors, which records ESR_EL1 and skips the instruction; the
+ * caller's VBAR_EL1 is restored. Clobbers x1-x5, x16, x17. */
+.global deadman_probe
+deadman_probe:
+    mrs x1, vbar_el1
+    adr x2, deadman_vectors
+    msr vbar_el1, x2
+    isb
+    adr x3, deadman_trap_esr
+    str xzr, [x3]
+    mov x4, xzr
+    mrs x4, S3_1_C15_C2_1        /* CPUECTLR_EL1 (A53/A73: bit 6 SMPEN) */
+    ldr x5, [x3]
+    stp x4, x5, [x0]
+    str xzr, [x3]
+    mov x4, xzr
+    mrs x4, S3_1_C15_C2_0        /* CPUACTLR_EL1 */
+    ldr x5, [x3]
+    stp x4, x5, [x0, #16]
+    msr vbar_el1, x1
+    isb
+    ret
+
+.balign 2048
+deadman_vectors:
+.rept 16
+    b deadman_trap
+.balign 128
+.endr
+deadman_trap:
+    mrs x17, esr_el1
+    adr x16, deadman_trap_esr
+    str x17, [x16]
+    mrs x17, elr_el1
+    add x17, x17, #4
+    msr elr_el1, x17
+    eret
+
 .section .data, "aw"
 .balign 8
+deadman_trap_esr:
+    .quad 0
 .global deadman_alive
 deadman_alive:
-    .quad 0, 0, 0, 0, 0, 0, 0, 0
+    /* 0 magic, 1 CurrentEL, 2 CNTPCT, 3 SCTLR, 4 MPIDR, 5 heartbeat,
+     * 6 stage, 7 x0 at entry, 8-11 deadman_probe output */
+    .quad 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 .global deadman_deadline_cell
 deadman_deadline_cell:
     .quad 0
