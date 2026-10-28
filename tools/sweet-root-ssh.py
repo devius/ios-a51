@@ -24,7 +24,11 @@ ssh-keygen, so the host key does not change between reinstalls.
                            on 192.168.7.1, bash's /dev/udp): root's account
                            as getpwnam sees it, sshd -T, sshd.log, then runs
                            sshd -d on port 2222 (debug: says why a login is
-                           refused). Keys as qemu-t8030's bash job
+                           refused). getpwnam fails for every user on this
+                           port ("id root": no such user); sshd gets
+                           XBS_DISABLE_LIBINFO=YES, Libinfo's switch that
+                           skips the usermanagerd source.
+                           Keys as qemu-t8030's bash job
                            (POSIXSpawnType Interactive, no pressured exit);
                            com.sweet.sshlog (no spawn type) never started
   passwd                   "sshd" (uid 75, as iOS's _sshd): sshd's privilege
@@ -58,10 +62,16 @@ tag() { while IFS= read -r l; do echo "SSHDIAG $1 $l"; done; }
 	/private/var/root/.ssh /private/var/root/.ssh/authorized_keys /var/jb/bin/bash \
 	/var/jb/var/empty /var/jb/var/log; ls -ln /var/jb/var/log; cat /etc/shells; } 2>&1 | tag sys
 grep -E '^(root|sshd|_sshd):' /etc/master.passwd /etc/passwd 2>&1 | tag pw
+# user lookups (getpwnam) fail on this port: try each Libinfo path
+for u in root 0 mobile 501 _sshd sshd; do
+	echo "id $u: $(id $u 2>&1) | XBS_DISABLE_LIBINFO: $(XBS_DISABLE_LIBINFO=YES id $u 2>&1)"
+done 2>&1 | tag id
+ls -ld /etc 2>&1 | tag id
 sshd -T -o UsePAM=no -o StrictModes=no 2>&1 | grep -iE 'permitroot|pubkey|password|authorizedkeys|strict|usepam|usedns|allowusers|denyusers' | tag cfg
 cat /var/jb/var/log/sshd.log /var/jb/var/log/sshd.out 2>&1 | tail -n 30 | tag log
 while true; do
-	sshd -d -D -p 2222 -o UsePAM=no -o StrictModes=no -o LogLevel=DEBUG2 2>&1 | tag dbg
+	# re-exec needs the absolute path
+	XBS_DISABLE_LIBINFO=YES /var/jb/usr/sbin/sshd -d -D -p 2222 -o UsePAM=no -o StrictModes=no -o LogLevel=DEBUG2 2>&1 | tag dbg
 	sleep 2
 done
 '''
@@ -108,7 +118,9 @@ def launchd(root):
         'Label': 'com.sweet.sshd',
         'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-o', 'UsePAM=no', '-o', 'StrictModes=no',
                              '-o', 'LogLevel=VERBOSE', '-E', '/var/jb/var/log/sshd.log'],
-        'EnvironmentVariables': {'PATH': '/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin'},
+        # Libinfo: skip the usermanagerd (muser) source and read /etc/master.passwd
+        'EnvironmentVariables': {'PATH': '/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin',
+                                 'XBS_DISABLE_LIBINFO': 'YES'},
         'StandardOutPath': '/var/jb/var/log/sshd.out',
         'StandardErrorPath': '/var/jb/var/log/sshd.out',
         'UserName': 'root',
