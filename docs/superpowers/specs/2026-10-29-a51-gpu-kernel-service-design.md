@@ -1,6 +1,9 @@
 # A51 GPU, sub-project 1: kernel GPU service (Mali-G72 MP3) — design
 
-Status: approved in conversation (approach, Sections 1–3), 2026-10-29. Next: implementation plan.
+Status: approved in conversation (approach, Sections 1–3), 2026-10-29.
+Amended 2026-10-29: page tables in the legacy Mali-LPAE format (Section 2.1)
+and no G72 configuration quirks (Section 3), both measured against Linux
+Panfrost v6.6. Next: implementation plan.
 
 ## Goal and context
 
@@ -24,8 +27,8 @@ The owner chose **"both, staged"**: first a smooth system UI over OpenGL ES
 
 - **A — port HeroGPU, adapted to Bifrost (chosen).** The same two layers and
   the same IOKit interface as the S7 (`bsd/dev/herolte_gpu.c`,
-  `iokit/Kernel/arm/HeroGPU.cpp`, patches 0225–0249), with Bifrost's MMU
-  format, A51 addresses and G72 quirks. Proven on this kernel lineage (Mesa
+  `iokit/Kernel/arm/HeroGPU.cpp`, patches 0225–0249), with A51 addresses,
+  the G72's job configuration and without the T880's quirks. Proven on this kernel lineage (Mesa
   triangle at 159 fps inside iOS on the S7); the S7's Mesa glue and the EAGL
   shim were written against this interface, so sub-projects 2–3 become ports.
 - B — a fuller Panfrost-DRM clone (per-process address spaces, async jobs,
@@ -57,8 +60,8 @@ The GPU is powered and clocked at handoff (as on the S7), so no PMU or ACPM
 
 A board module for the A51 (guarded like the other A51 code) maps the GPU at
 `0x11500000`, reads the same registers only when the PMU G3D status low
-nibble is `0xf` (an unpowered block can hang the bus), soft-resets the GPU,
-applies the G72 quirks (Section 3), and powers L2, then the 3 shader cores,
+nibble is `0xf` (an unpowered block can hang the bus), soft-resets the GPU
+(no configuration quirks, Section 3), and powers L2, then the 3 shader cores,
 then the tiler via the `*_PWRON` registers, with bounded polls on the
 `*_READY` registers. Equivalent of the S7's patch 0225. Boot-arg
 `a51gpu=0|1|2|3`: 0 skips everything, 1 (default) probes, 2 also powers the
@@ -72,12 +75,16 @@ submission and memory visibility end to end.
 
 ## Section 2: MMU and memory
 
-1. **Page-table format: AArch64 4 KB granule**, selected in `AS_TRANSCFG`
-   (Midgard's legacy Mali-LPAE format, used by the S7, does not apply). PTEs
-   are ARMv8 stage-1 descriptors whose AttrIndx selects a `AS_MEMATTR` slot;
-   GPU mappings use a non-cacheable attribute because the GPU is not
-   coherent with the CPU caches. Linux Panfrost's Bifrost configuration is
-   the reference for `TRANSCFG`/`MEMATTR` values.
+1. **Page-table format: legacy Mali-LPAE, 4 KB pages, as HeroGPU.** Linux
+   Panfrost v6.6 drives every Mali it supports, Bifrost G72 included, with
+   `ARM_MALI_LPAE` page tables (`panfrost_mmu.c`: `alloc_io_pgtable_ops
+   (ARM_MALI_LPAE, ...)`) and never writes `AS_TRANSCFG`, so the G72 stays in
+   its reset-default legacy mode. `AS_TRANSTAB` takes the table base with
+   `ADRMODE_TABLE` (`0x3`) and the flags HeroGPU uses; `AS_MEMATTR` as
+   HeroGPU (non-cacheable for GPU mappings: the GPU is not coherent with the
+   CPU caches). HeroGPU's page-table code carries over unchanged; the
+   AArch64 4 KB format (`AS_TRANSCFG`, later Linux) stays a possible later
+   change with no interface impact.
 2. **One address space (AS0) for everything, HeroGPU's map:**
 
    | GPU VA | Use |
@@ -128,14 +135,18 @@ type 0:
 1. One job at a time under a mutex, polled with a time limit (only
    backboardd uses the GPU in sub-projects 1–4).
 2. Slots: 0 fragment, 1 vertex/tiler/compute, 2 unused.
-3. Per-job configuration flushes the GPU caches at job start and end (the GPU
-   is not coherent), with the flags Panfrost uses on Bifrost.
-4. G72 r0p1 quirks from Linux (Panfrost's quirk setup and ARM kbase's
-   hardware-issue table for this revision), applied at power-up and after
-   every reset; replaces HeroGPU's T880 patch 0243.
+3. Per-job configuration (`JS_CONFIG_NEXT`), as Panfrost: thread priority 8,
+   flush clean+invalidate at job start (`3 << 8`) and end (`3 << 12`) because
+   the GPU is not coherent, plus `ENABLE_FLUSH_REDUCTION` (bit 14), which the
+   G72 has (`hw_features_g72`: `FLUSH_REDUCTION`).
+4. No configuration quirks. Panfrost's `panfrost_gpu_init_quirks` writes
+   none for the G72: `hw_features_g72` has neither `TLS_HASHING` nor
+   `IDVS_GROUP_SIZE`, and every issue that function checks is Midgard- or
+   G76-only. HeroGPU's T880 quirks (patch 0243: `SC_LS_ALLOW_ATTR_TYPES`,
+   tiler clock-gate override, job throttle) must not be applied.
 5. Fault recovery as HeroGPU's patch 0249: hard-stop a faulted or unfinished
-   job; if a slot stays active, soft-reset the GPU and bring it back (cores,
-   quirks, AS0 reprogrammed on every job).
+   job; if a slot stays active, soft-reset the GPU and bring it back (cores
+   powered again, AS0 reprogrammed on every job).
 6. Each job is logged (slot, status, µs) to the console, behind the boot-arg,
    so it shows in the USB live log.
 
@@ -147,7 +158,7 @@ power management (the GPU stays on), DVFS. None changes the interface above.
 ## Code layout
 
 - `bsd/dev/a51_gpu.c` — hardware layer (port of `herolte_gpu.c`): probe,
-  power, reset, quirks, AS0 page tables in AArch64 format, job run, fault
+  power, reset, AS0 page tables in Mali-LPAE format, job run, fault
   recovery, the boot-time Step 2 job.
 - `iokit/Kernel/arm/HeroGPU.cpp` — the S7's user client, with the A51 board
   guard added; calls into `a51_gpu.c` through the same function names the S7
@@ -172,9 +183,11 @@ in the boot-arg; user-space steps need only SSH (`scp`, run):
 
 ## Risks
 
-- G72 quirk values: wrong or missing quirks show as job faults
-  (`DATA_INVALID_FAULT` on the S7); mitigated by copying Linux's table for
-  this exact revision and logging every job's status.
+- G72 job behaviour: a missing setting shows as job faults
+  (`DATA_INVALID_FAULT` on the S7); mitigated by following Panfrost v6.6 for
+  the G72 exactly (no quirks, its `JS_CONFIG` flags) and logging every job's
+  status. Panfrost's G72 hardware-issue list (`panfrost_issues.h`) was not
+  re-read (GitHub rate limit); it only affects job handling, not setup.
 - Bank-1 region assumption: no firmware carve-out is documented there
   (`A51_PROGRESS.md`, Hardware Map §1); Step 3 writes and reads it through
   the GPU before anything depends on it.
