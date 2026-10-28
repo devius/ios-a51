@@ -19,19 +19,27 @@ ssh-keygen, so the host key does not change between reinstalls.
                            earlier com.sweet.dropbear job is removed
                            (Procursus' dropbear needs libtomcrypt1, which
                            the 1900 index lacks)
+                           job com.sweet.sshlog: bash sends new lines of
+                           sshd.log to the PC's live log (udp/5140 on
+                           192.168.7.1, bash's /dev/udp)
   passwd                   "sshd" (uid 75, as iOS's _sshd): sshd's privilege
                            separation user
-  root                     shell /var/jb/bin/bash (iOS has no /bin/sh), listed
-                           in /etc/shells; AUTHORIZED_KEY in ~root/.ssh
+  root                     shell /var/jb/bin/bash, listed in /etc/shells;
+                           AUTHORIZED_KEY in ~root/.ssh
+  /bin/sh, /bin/bash       links to /var/jb/bin/bash: iOS has no /bin/sh,
+                           which is root's stock shell (sshd refuses users
+                           whose shell does not exist) and what system(3)
+                           runs
 
-Run as root. Idempotent: /private/var/jb is replaced on every run. The phone is reached over the USB Ethernet gadget
-(sweetusb=2) at 192.168.7.2.
+Run as root. Idempotent: /private/var/jb is replaced on every run. The phone
+is reached over the USB Ethernet gadget (sweetusb=2) at 192.168.7.2.
 """
 import os, plistlib, shutil, sys
 
 LAUNCHD = 'System/Library/xpc/launchd.plist'
 JOB = '/System/Library/LaunchDaemons/com.sweet.sshd.plist'
 OLD_JOB = '/System/Library/LaunchDaemons/com.sweet.dropbear.plist'
+LOG_JOB = '/System/Library/LaunchDaemons/com.sweet.sshlog.plist'
 SHELL = '/var/jb/bin/bash'
 PRIVSEP = {'master.passwd': 'sshd:*:75:75::0:0:sshd Privilege separation:/var/jb/var/empty:/usr/bin/false',
            'passwd': 'sshd:*:75:75:sshd Privilege separation:/var/jb/var/empty:/usr/bin/false'}
@@ -78,11 +86,31 @@ def launchd(root):
         'KeepAlive': True,
         'POSIXSpawnType': 'Interactive',
     }
+    # tail exits when a send fails (USB link not up yet); launchd restarts it
+    jobs[LOG_JOB] = {
+        'Label': 'com.sweet.sshlog',
+        'ProgramArguments': [SHELL, '-c', 'exec /var/jb/usr/bin/tail -n 40 -F /var/jb/var/log/sshd.log '
+                                          '> /dev/udp/192.168.7.1/5140'],
+        'UserName': 'root',
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'ThrottleInterval': 15,
+    }
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(path, st.st_uid, st.st_gid)
     os.chmod(path, st.st_mode & 0o7777)
-    print('launchd.plist: job com.sweet.sshd')
+    print('launchd.plist: jobs com.sweet.sshd, com.sweet.sshlog')
+
+
+def bin_sh(root):
+    os.makedirs(os.path.join(root, 'bin'), exist_ok=True)
+    for n in ('sh', 'bash'):
+        path = os.path.join(root, 'bin', n)
+        if not os.path.lexists(path):
+            os.symlink(SHELL, path)
+            os.lchown(path, 0, 0)
+    print('/bin/sh, /bin/bash ->', SHELL)
 
 
 def accounts(root):
@@ -129,6 +157,7 @@ def main():
     install_tree(root, tree, hostkeys)
     launchd(root)
     accounts(root)
+    bin_sh(root)
     authorized_key(root, key)
 
 
