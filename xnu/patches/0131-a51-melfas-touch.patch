@@ -19,13 +19,26 @@ contacts at the panel edge while charging from the USB cable. Set
 CTRL/CHARGER_MODE = 1 at start (mms_charger_attached(); boot-arg
 a51touchcharger=0 to skip), drop palm/hover/proximity contacts
 (TOUCHTYPE_PALM/HOVER/PROXIMITY), and rate-limit the alert log with the
-mode-state value.
+Boot 32 then delivered clean single-finger swipes from the bottom edge
+(type 0, EdgeTip set) that still did not unlock, under ~280 VSYNC_ON
+mode-state alerts per second. As in the S7 port (herolte 0217, where the
+swipe-up only completed once lost reads stopped dropping move events), every
+event read is retried up to 10 times like mms_i2c_read(), and the worker logs
+moves/i2c_retries/lost_reads plus each contact's move count and duration.
 
 diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
-index ba647a8..0d9561d 100644
+index ba647a8..15cf1da 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
-@@ -920,11 +920,295 @@ dreamlte_touch_start(void)
+@@ -8,6 +8,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -920,11 +921,333 @@ dreamlte_touch_start(void)
  }
  #endif /* DREAMLTE */
  
@@ -70,6 +83,8 @@ index ba647a8..0d9561d 100644
 +static int a51ts_sleep;
 +static bool a51ts_down[A51TS_FINGERS];
 +static uint16_t a51ts_x[A51TS_FINGERS], a51ts_y[A51TS_FINGERS];
++static uint32_t a51ts_moves[A51TS_FINGERS];      /* samples since down */
++static uint64_t a51ts_t0[A51TS_FINGERS];         /* mach time of down */
 +
 +static int
 +a51iic_wait(void)
@@ -165,6 +180,24 @@ index ba647a8..0d9561d 100644
 +	return e == 0;
 +}
 +
++static unsigned a51ts_retries, a51ts_lost, a51ts_total_moves;
++
++/* Like mms_i2c_read()/sec_ts_i2c_read(): retry a failed read (the S7 port's
++ * swipe-up only completed once lost reads stopped dropping move events). */
++static bool
++a51ts_read_retry(uint8_t r0, uint8_t r1, uint8_t *buf, unsigned rlen)
++{
++	for (int attempt = 0; attempt < 10; attempt++) {
++		if (a51ts_read(r0, r1, buf, rlen)) {
++			return true;
++		}
++		a51ts_retries++;
++		delay(100);
++	}
++	a51ts_lost++;
++	return false;
++}
++
 +static void
 +a51ts_report(const uint8_t *p)
 +{
@@ -188,6 +221,11 @@ index ba647a8..0d9561d 100644
 +	if (state == 1 || state == 2) {
 +		if (!a51ts_down[id]) {
 +			printf("A51 TOUCH: down id=%d x=%u y=%u type=%u\n", id, x, y, type);
++			a51ts_moves[id] = 0;
++			a51ts_t0[id] = mach_absolute_time();
++		} else {
++			a51ts_moves[id]++;
++			a51ts_total_moves++;
 +		}
 +		a51ts_down[id] = true;
 +		a51ts_x[id] = (uint16_t)x;
@@ -196,6 +234,10 @@ index ba647a8..0d9561d 100644
 +			sweet_hid_touch(id, 1, (int)x, (int)y);
 +		}
 +	} else if (state == 3 && a51ts_down[id]) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - a51ts_t0[id], &ns);
++		printf("A51 TOUCH: up id=%d x=%u y=%u after %u moves in %llu ms\n", id,
++		    a51ts_x[id], a51ts_y[id], a51ts_moves[id], ns / NSEC_PER_MSEC);
 +		a51ts_down[id] = false;
 +		if (id < 5) {
 +			sweet_hid_touch(id, 0, a51ts_x[id], a51ts_y[id]);
@@ -220,13 +262,22 @@ index ba647a8..0d9561d 100644
 +	unsigned errors = 0;
 +	(void)arg;
 +	(void)result;
++	unsigned ticks = 0, last_moves = 0, last_retries = 0, last_lost = 0;
 +	printf("A51 TOUCH: worker started\n");
 +	for (;;) {
++		if (++ticks % 4000 == 0 && (a51ts_total_moves != last_moves ||
++		    a51ts_retries != last_retries || a51ts_lost != last_lost)) {
++			printf("A51 TOUCH: moves=%u i2c_retries=%u lost_reads=%u\n",
++			    a51ts_total_moves, a51ts_retries, a51ts_lost);
++			last_moves = a51ts_total_moves;
++			last_retries = a51ts_retries;
++			last_lost = a51ts_lost;
++		}
 +		if (a5touch_read(a51ts_alive, A51TS_GPA0DAT) & 1u) {   /* INT high: idle */
 +			a51ts_wait(8);
 +			continue;
 +		}
-+		if (!a51ts_read(0x02, 0x10, &info, 1)) {               /* EVENT / PACKET_INFO */
++		if (!a51ts_read_retry(0x02, 0x10, &info, 1)) {         /* EVENT / PACKET_INFO */
 +			if (++errors <= 8 || !(errors & 255)) {
 +				printf("A51 TOUCH: packet info read failed (%u)\n", errors);
 +			}
@@ -237,7 +288,7 @@ index ba647a8..0d9561d 100644
 +		if (size == 0 || size > sizeof(buf)) {
 +			size = sizeof(buf);
 +		}
-+		if (!a51ts_read(0x02, 0x11, buf, size)) {              /* EVENT / PACKET_DATA */
++		if (!a51ts_read_retry(0x02, 0x11, buf, size)) {        /* EVENT / PACKET_DATA */
 +			a51ts_wait(20);
 +			continue;
 +		}
