@@ -1,0 +1,562 @@
+A51 GPU: HeroGPU user client (iokit/Kernel/arm/HeroGPU.cpp).
+
+The Galaxy S7's IOKit face of its Panfrost-style GPU service, unchanged
+apart from the board guard and the GPU name: IOServiceMatching("HeroGPU"),
+open type 0, selectors 0 GetParam (Panfrost DRM params; GPU_PROD_ID =
+GPU_ID >> 16 = 0x6221 on the G72), 1 CreateBO, 2 FreeBO, 3 MapBO
+(write-combined), 4 Submit, 5 Log, 6 SurfaceBO, 7 SyncBO. It drives
+bsd/dev/a51_gpu.c through the S7's herolte_gpu_* interface (patch 0139).
+Personality on IOResources for the A5XELTE board config (which is the A51
+in this fork). herogpu_selftest=1 runs a WRITE_VALUE job through these
+paths about 70 s after boot.
+
+diff --git i/iokit/Kernel/arm/HeroGPU.cpp w/iokit/Kernel/arm/HeroGPU.cpp
+new file mode 100644
+index 0000000..62c280a
+--- /dev/null
++++ w/iokit/Kernel/arm/HeroGPU.cpp
+@@ -0,0 +1,513 @@
++/*
++ * HeroGPU: the Galaxy A51's Mali-G72 MP3 for user space, the kernel half of
++ * a Panfrost-style driver (Mesa's Panfrost/Bifrost in an iOS process, the
++ * way ry-diffusion/Bergamota runs freedreno for the Adreno 630). Ported
++ * unchanged from the Galaxy S7's HeroGPU (wardevsa/ios-a5xelte herolte,
++ * Mali-T880) apart from the board guard and the GPU name, so the S7's user
++ * side works as is.
++ *
++ * The GPU itself is driven by bsd/dev/a51_gpu.c (power-up, page tables,
++ * job slots; one address space, jobs run one at a time, polled). This file
++ * is the IOKit face: IOServiceMatching("HeroGPU"), open type 0, then
++ *
++ *   0 GetParam    [param]           -> [value]   Panfrost DRM param numbers
++ *   1 CreateBO    [size]            -> [handle, gpu_va, size]
++ *   2 FreeBO      [handle]
++ *   3 MapBO       [handle]          -> [user address]  (write-combined)
++ *   4 Submit      [jc_va, js]       -> [status, us]    js 0 fragment, 1 the rest
++ *   5 Log         struct: text      (to the kernel log; test programs)
++ *   6 SurfaceBO   [IOSurface id]    -> [handle, gpu_va, size, bytes per row, width,
++ *                                       height, pixel format, offset, planes]
++ *   7 SyncBO      [handle]          clean+invalidate an imported surface's CPU caches
++ *
++ * Buffers are wired kernel buffers mapped noncached on the GPU side; the
++ * Mali is not IO-coherent, so the CPU sees them write-combined only (their
++ * cacheable kernel alias is cleaned once, after zeroing, and never used
++ * again). Submit is synchronous: status 0 = the chain finished cleanly,
++ * else the job slot's status. Everything a client created goes away with it.
++ *
++ * Boot-arg herogpu_selftest=1 runs a WRITE_VALUE job through these same
++ * paths about 70 s after boot (log: "HEROGPU SELFTEST").
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(A51)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include "SweetSurface.h"
++
++extern "C" {
++bool herolte_gpu_up(void);
++uint32_t herolte_gpu_reg(uint32_t off);
++uint64_t herolte_gpu_va_alloc(uint64_t bytes);
++bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
++void herolte_gpu_unmap(uint64_t va, unsigned n);
++uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
++}
++
++enum {
++	kHeroGPUGetParam = 0,
++	kHeroGPUCreateBO = 1,
++	kHeroGPUFreeBO   = 2,
++	kHeroGPUMapBO    = 3,
++	kHeroGPUSubmit   = 4,
++	kHeroGPULog      = 5,
++	kHeroGPUSurfaceBO = 6,
++	kHeroGPUSyncBO   = 7,
++};
++
++#define HEROGPU_MAX_BOS         4096
++#define HEROGPU_MAX_BO_BYTES    (256ull << 20)
++
++/* Panfrost DRM_PANFROST_PARAM_* -> Midgard register offsets. */
++static uint32_t
++herogpu_param_reg(uint64_t param)
++{
++	static const uint16_t regs[] = {
++		0x000,  /* 0 GPU_PROD_ID (GPU_ID >> 16, below) */
++		0x000,  /* 1 GPU_REVISION (GPU_ID & 0xffff, below) */
++		0x100,  /* 2 SHADER_PRESENT */
++		0x110,  /* 3 TILER_PRESENT */
++		0x120,  /* 4 L2_PRESENT */
++		0xe00,  /* 5 STACK_PRESENT */
++		0x018,  /* 6 AS_PRESENT */
++		0x01c,  /* 7 JS_PRESENT */
++		0x004,  /* 8 L2_FEATURES */
++		0x008,  /* 9 CORE_FEATURES */
++		0x00c,  /* 10 TILER_FEATURES */
++		0x010,  /* 11 MEM_FEATURES */
++		0x014,  /* 12 MMU_FEATURES */
++		0x0ac,  /* 13 THREAD_FEATURES */
++		0x0a0,  /* 14 MAX_THREADS */
++		0x0a4,  /* 15 THREAD_MAX_WORKGROUP_SZ */
++		0x0a8,  /* 16 THREAD_MAX_BARRIER_SZ */
++		0x300,  /* 17 COHERENCY_FEATURES */
++		0x0b0, 0x0b4, 0x0b8, 0x0bc,     /* 18-21 TEXTURE_FEATURES0-3 */
++	};
++	if (param < sizeof(regs) / sizeof(regs[0])) {
++		return regs[param];
++	}
++	if (param >= 22 && param < 38) {
++		return 0x0c0 + (uint32_t)(param - 22) * 4;     /* JS_FEATURES0-15 */
++	}
++	return ~0u;
++}
++
++static uint64_t
++herogpu_param(uint64_t param)
++{
++	uint32_t id = herolte_gpu_reg(0x000);
++	switch (param) {
++	case 0:
++		return id >> 16;
++	case 1:
++		return id & 0xffff;
++	case 38:        /* NR_CORE_GROUPS: one L2 */
++		return 1;
++	case 39:        /* THREAD_TLS_ALLOC: none before v7 */
++		return 0;
++	case 40:        /* AFBC_FEATURES: v7+ only */
++		return 0;
++	}
++	uint32_t reg = herogpu_param_reg(param);
++	return reg == ~0u ? 0 : herolte_gpu_reg(reg);
++}
++
++struct herogpu_bo {
++	IOBufferMemoryDescriptor *mem;          /* own buffer, or NULL for an imported surface */
++	SweetSurface             *surface;      /* imported IOSurface (retained), or NULL */
++	IOMemoryMap              *umap;
++	uint64_t                  va;
++	uint32_t                  pages;
++};
++
++static bool
++herogpu_bo_used(const struct herogpu_bo *bo)
++{
++	return bo->mem != NULL || bo->surface != NULL;
++}
++
++static IOMemoryDescriptor *
++herogpu_bo_memory(const struct herogpu_bo *bo)
++{
++	return bo->mem != NULL ? (IOMemoryDescriptor *)bo->mem :
++	       bo->surface != NULL ? bo->surface->memory : NULL;
++}
++
++/* Clean and invalidate the CPU caches over a surface's pixels (the Mali is not IO-coherent). */
++static void
++herogpu_surface_sync(SweetSurface *s)
++{
++	uintptr_t k = s->kernelAddress();
++	if (k == 0) {
++		return;
++	}
++	for (uintptr_t p = k & ~(uintptr_t)63; p < k + s->allocSize; p += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Map IOSurface `id`'s pixels into the GPU (the EAGL shim's GPU blit into
++ * backboardd's display surfaces). Kernel-allocated and physical surfaces
++ * only: wrapped client memory is not a SweetSurface buffer the GPU may
++ * write. The surface stays retained until the BO is freed.
++ */
++static bool
++herogpu_bo_import_surface(struct herogpu_bo *bo, uint32_t id)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s->memory == NULL || s->allocSize == 0) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	uint64_t size = ((uint64_t)s->allocSize + 0xfff) & ~0xfffull;
++	if (size > s->memory->getLength() || size > HEROGPU_MAX_BO_BYTES) {
++		s->release();
++		return false;
++	}
++	bo->pages = (uint32_t)(size / 0x1000);
++	uint64_t *pa = (uint64_t *)IOMallocData(bo->pages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t i = 0; ok && i < bo->pages; i++) {
++		IOByteCount len = 0;
++		pa[i] = s->memory->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
++		ok = pa[i] != 0 && (pa[i] & 0xfff) == 0;
++	}
++	bo->va = ok ? herolte_gpu_va_alloc(size) : 0;
++	ok = bo->va != 0 && herolte_gpu_map(bo->va, pa, bo->pages);
++	if (pa != NULL) {
++		IOFreeData(pa, bo->pages * sizeof(uint64_t));
++	}
++	if (!ok) {
++		if (bo->va != 0) {
++			herolte_gpu_unmap(bo->va, bo->pages);   /* and its VA */
++		}
++		s->release();
++		bo->va = 0;
++		bo->pages = 0;
++		return false;
++	}
++	/* Dirty CPU lines written back later would land over the GPU's pixels. */
++	herogpu_surface_sync(s);
++	bo->surface = s;
++	return true;
++}
++
++/* Allocate, zero, clean and GPU-map a buffer. */
++static bool
++herogpu_bo_create(struct herogpu_bo *bo, uint64_t size)
++{
++	size = (size + 0xfff) & ~0xfffull;
++	if (size == 0 || size > HEROGPU_MAX_BO_BYTES) {
++		return false;
++	}
++	bo->mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
++	if (bo->mem == NULL) {
++		return false;
++	}
++	uintptr_t k = (uintptr_t)bo->mem->getBytesNoCopy();
++	bzero((void *)k, size);
++	for (uintptr_t p = k & ~(uintptr_t)63; p < k + size; p += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bo->pages = (uint32_t)(size / 0x1000);
++	uint64_t *pa = (uint64_t *)IOMallocData(bo->pages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t i = 0; ok && i < bo->pages; i++) {
++		IOByteCount len = 0;
++		pa[i] = bo->mem->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
++		ok = pa[i] != 0;
++	}
++	bo->va = ok ? herolte_gpu_va_alloc(size) : 0;
++	ok = bo->va != 0 && herolte_gpu_map(bo->va, pa, bo->pages);
++	if (pa != NULL) {
++		IOFreeData(pa, bo->pages * sizeof(uint64_t));
++	}
++	if (!ok) {
++		if (bo->va != 0) {
++			herolte_gpu_unmap(bo->va, bo->pages);   /* and its VA */
++		}
++		OSSafeReleaseNULL(bo->mem);
++		bo->va = 0;
++	}
++	return ok;
++}
++
++static void
++herogpu_bo_free(struct herogpu_bo *bo)
++{
++	if (!herogpu_bo_used(bo)) {
++		return;
++	}
++	herolte_gpu_unmap(bo->va, bo->pages);
++	OSSafeReleaseNULL(bo->umap);
++	OSSafeReleaseNULL(bo->mem);
++	OSSafeReleaseNULL(bo->surface);
++	bzero(bo, sizeof(*bo));
++}
++
++class HeroGPU : public IOService {
++	OSDeclareDefaultStructors(HeroGPU);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HeroGPU, IOService);
++
++class HeroGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(HeroGPUUserClient);
++
++	task_t             fTask;
++	IOLock            *fLock;
++	struct herogpu_bo *fBOs;          /* handle = index + 1 */
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HeroGPUUserClient, IOUserClient);
++
++static void herogpu_selftest(void *arg, wait_result_t wr);
++
++bool
++HeroGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "HeroGPUUserClient");
++	setProperty("GPU", "Mali-G72 MP3");
++	registerService();
++	IOLog("HEROGPU: registered\n");
++	int selftest = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("herogpu_selftest", &selftest, sizeof(selftest)) && selftest &&
++	    kernel_thread_start(herogpu_selftest, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return true;
++}
++
++bool
++HeroGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	fBOs = (struct herogpu_bo *)IOMallocZeroData(HEROGPU_MAX_BOS * sizeof(*fBOs));
++	return fLock != NULL && fBOs != NULL && herolte_gpu_up();
++}
++
++IOReturn
++HeroGPUUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++HeroGPUUserClient::free(void)
++{
++	if (fBOs != NULL) {
++		for (unsigned i = 0; i < HEROGPU_MAX_BOS; i++) {
++			herogpu_bo_free(&fBOs[i]);
++		}
++		IOFreeData(fBOs, HEROGPU_MAX_BOS * sizeof(*fBOs));
++		fBOs = NULL;
++	}
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++HeroGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	uint64_t out[9] = { 0 };
++	uint32_t outCount = 0;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++
++	IOLockLock(fLock);
++	switch (selector) {
++	case kHeroGPUGetParam:
++		out[0] = herogpu_param(in0);
++		outCount = 1;
++		break;
++	case kHeroGPUCreateBO: {
++		unsigned i = 0;
++		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
++			i++;
++		}
++		if (i == HEROGPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++		} else if (!herogpu_bo_create(&fBOs[i], in0)) {
++			ret = kIOReturnNoMemory;
++		} else {
++			out[0] = i + 1;
++			out[1] = fBOs[i].va;
++			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			outCount = 3;
++		}
++		break;
++	}
++	case kHeroGPUFreeBO:
++		if (in0 == 0 || in0 > HEROGPU_MAX_BOS || !herogpu_bo_used(&fBOs[in0 - 1])) {
++			ret = kIOReturnBadArgument;
++		} else {
++			herogpu_bo_free(&fBOs[in0 - 1]);
++		}
++		break;
++	case kHeroGPUMapBO: {
++		struct herogpu_bo *bo = in0 && in0 <= HEROGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
++		if (bo == NULL || !herogpu_bo_used(bo)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (bo->umap == NULL) {
++			/* A surface keeps the cache mode its other mappings use. */
++			bo->umap = herogpu_bo_memory(bo)->createMappingInTask(fTask, 0,
++			    kIOMapAnywhere | (bo->surface ? bo->surface->mapCache : kIOMapWriteCombineCache));
++		}
++		if (bo->umap == NULL) {
++			ret = kIOReturnNoMemory;
++		} else {
++			out[0] = bo->umap->getAddress();
++			outCount = 1;
++		}
++		break;
++	}
++	case kHeroGPUSubmit:
++		out[0] = herolte_gpu_submit(in1 ? 1 : 0, in0, &out[1]);
++		outCount = 2;
++		break;
++	case kHeroGPUSurfaceBO: {
++		unsigned i = 0;
++		while (i < HEROGPU_MAX_BOS && herogpu_bo_used(&fBOs[i])) {
++			i++;
++		}
++		if (i == HEROGPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++		} else if (!herogpu_bo_import_surface(&fBOs[i], (uint32_t)in0)) {
++			ret = kIOReturnNotFound;
++		} else {
++			SweetSurface *s = fBOs[i].surface;
++			out[0] = i + 1;
++			out[1] = fBOs[i].va;
++			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			out[3] = s->bytesPerRow;
++			out[4] = s->width;
++			out[5] = s->height;
++			out[6] = s->pixelFormat;
++			out[7] = s->offset;
++			out[8] = s->planeCount;
++			outCount = 9;
++		}
++		break;
++	}
++	case kHeroGPUSyncBO: {
++		struct herogpu_bo *bo = in0 && in0 <= HEROGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
++		if (bo == NULL || !herogpu_bo_used(bo)) {
++			ret = kIOReturnBadArgument;
++		} else if (bo->surface != NULL) {
++			herogpu_surface_sync(bo->surface);
++		}
++		break;
++	}
++	case kHeroGPULog:
++		/* Test programs have no console here: their lines go to the
++		 * kernel log (and the USERDATA log ring). */
++		if (args->structureInput != NULL && args->structureInputSize > 0) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("HEROGPU [%s]: %.*s\n", name,
++			    (int)(args->structureInputSize < 1024u ? args->structureInputSize : 1024u),
++			    (const char *)args->structureInput);
++		}
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = i < outCount ? out[i] : 0;
++	}
++	static uint32_t logged;
++	if (selector < 32 && !(logged & (1u << selector))) {
++		logged |= 1u << selector;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("HEROGPU: %s sel %u in %u -> 0x%x\n", name, selector, args->scalarInputCount, ret);
++	}
++	return ret;
++}
++
++/*
++ * herogpu_selftest=1: a WRITE_VALUE job (64-bit zero over a canary)
++ * through the same buffer and submit paths a client uses.
++ */
++static void
++herogpu_selftest(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(70000);
++	if (!herolte_gpu_up()) {
++		IOLog("HEROGPU SELFTEST: GPU not up\n");
++		return;
++	}
++	IOLog("HEROGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
++	    "texture features0 %#llx threads %llu\n", herogpu_param(0), herogpu_param(1),
++	    herogpu_param(2), herogpu_param(10), herogpu_param(18), herogpu_param(14));
++	struct herogpu_bo bo;
++	bzero(&bo, sizeof(bo));
++	if (!herogpu_bo_create(&bo, 0x10000)) {
++		IOLog("HEROGPU SELFTEST: buffer failed\n");
++		return;
++	}
++	/* Through a write-combined kernel mapping, as a client would. */
++	IOMemoryMap *map = bo.mem->createMappingInTask(kernel_task, 0,
++	    kIOMapAnywhere | kIOMapWriteCombineCache);
++	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
++	if (job == NULL) {
++		IOLog("HEROGPU SELFTEST: mapping failed\n");
++		herogpu_bo_free(&bo);
++		return;
++	}
++	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
++	*(volatile uint16_t *)(job + 18) = 1;           /* index */
++	*(volatile uint64_t *)(job + 32) = bo.va + 0x100;
++	*(volatile uint64_t *)(job + 40) = 3;           /* zero 64 bits */
++	volatile uint64_t *output = (volatile uint64_t *)(job + 0x100);
++	*output = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t us = 0;
++	uint32_t status = herolte_gpu_submit(1, bo.va, &us);
++	IOLog("HEROGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s\n",
++	    bo.va, status, us, *output, status == 0 && *output == 0 ? "OK" : "FAILED");
++	map->release();
++	herogpu_bo_free(&bo);
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && A51 */
+diff --git i/iokit/KernelConfigTables.cpp w/iokit/KernelConfigTables.cpp
+index 9a35982..afaabe0 100644
+--- i/iokit/KernelConfigTables.cpp
++++ w/iokit/KernelConfigTables.cpp
+@@ -96,6 +96,14 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    /* Mali-G72 for user space (iokit/Kernel/arm/HeroGPU.cpp, A51 only). */
++    "   {"
++    "     'IOClass'         = HeroGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = HeroGPU;"
++    "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git i/iokit/conf/files.arm64 w/iokit/conf/files.arm64
+index acc9ae0..8e749ce 100644
+--- i/iokit/conf/files.arm64
++++ w/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/HeroGPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

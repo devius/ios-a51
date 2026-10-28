@@ -1,0 +1,481 @@
+A51 GPU: address space, jobs, recovery, boot-time WRITE_VALUE (a51gpu=3).
+
+Second part of the Mali-G72 service (spec docs/superpowers/specs/2026-10-
+29-a51-gpu-kernel-service-design.md), ported from the S7's HeroGPU. AS0 in
+the legacy Mali-LPAE format (as Linux Panfrost drives the G72), HeroGPU's
+map (test pages 0x02000000, scratch 0x0a000000, user 0x40000000-
+0x7fffffff), tables and test/scratch pages in a 64 MiB region at
+0x8e0000000 outside XNU's RAM, one fixed L3 table per 2 MiB of the user
+range. Jobs run one at a time under a mutex, polled (200 ms), with
+Panfrost's JS_CONFIG for the G72 (flush clean+invalidate at both ends,
+flush reduction); a faulted or stuck job is hard-stopped and the GPU
+soft-reset if needed. a51gpu=2 brings it all up; a51gpu=3 also runs a
+chain at an unmapped VA (expects a fault and recovery) and then the
+WRITE_VALUE job. a51gpulog=1 logs every job. Exports HeroGPU's interface
+(herolte_gpu_up/reg/va_alloc/map/unmap/submit) for the user client.
+
+diff --git i/bsd/dev/a51_gpu.c w/bsd/dev/a51_gpu.c
+index 80fd580..a5590e8 100644
+--- i/bsd/dev/a51_gpu.c
++++ w/bsd/dev/a51_gpu.c
+@@ -11,8 +11,19 @@
+  * Panfrost writes none for the G72.
+  *
+  * Boot-arg a51gpu: 0 nothing, 1 (default) probe, 2 also soft-reset and power
+- * L2, all shader cores and the tiler. a51gpu_pretend_off=1 treats the domain
+- * as off (tests the guard). Every poll is bounded; failures log and return.
++ * L2, all shader cores and the tiler, and build the address space, 3 also run
++ * a job at an unmapped address (recovery) and a WRITE_VALUE job at boot.
++ * a51gpu_pretend_off=1 treats the domain as off (tests the guard);
++ * a51gpulog=1 logs every job. Every poll is bounded; failures log and return.
++ *
++ * One address space (AS0) in the legacy Mali-LPAE format (Linux Panfrost
++ * drives the G72 with ARM_MALI_LPAE and never writes AS_TRANSCFG), with
++ * HeroGPU's map: test pages 0x02000000, scratch 0x0a000000, user buffers
++ * 0x40000000..0x7fffffff. The tables, test pages and scratch block live in
++ * a 64 MiB region at 0x8e0000000 in bank 1, outside XNU's RAM
++ * (0x880000000..0x8a0000000). The user range has one fixed L3 table per
++ * 2 MiB, so tables are never exhausted. The rest of HeroGPU's interface
++ * (herolte_gpu_*) is exported unchanged for iokit/Kernel/arm/HeroGPU.cpp.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+@@ -20,6 +31,8 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -28,6 +41,13 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void a51_gpu_probe(void);
++/* User-space GPU jobs, for iokit/Kernel/arm/HeroGPU.cpp (the S7's names). */
++bool herolte_gpu_up(void);
++uint32_t herolte_gpu_reg(uint32_t off);
++uint64_t herolte_gpu_va_alloc(uint64_t bytes);
++bool herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
++void herolte_gpu_unmap(uint64_t va, unsigned n);
++uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ 
+ #define A51_PMU_PA              0x11860000u
+ #define A51_PMU_G3D_STAT        0x4064u
+@@ -55,10 +75,77 @@ void a51_gpu_probe(void);
+ #define COHERENCY_FEATURES      0x300
+ #define GPU_CMD_SOFT_RESET      0x01
+ #define GPU_IRQ_RESET_COMPLETED 0x100
++#define GPU_FAULTSTATUS         0x03c
++#define GPU_FAULTADDR_LO        0x040
++#define JOB_IRQ_RAWSTAT         0x1000
++#define JOB_IRQ_CLEAR           0x1004
++#define JS_BASE(n)              (0x1800u + (n) * 0x80u)
++#define JS_HEAD_LO              0x00
++#define JS_HEAD_HI              0x04
++#define JS_COMMAND              0x20
++#define JS_STATUS               0x24
++#define JS_HEAD_NEXT_LO         0x40
++#define JS_HEAD_NEXT_HI         0x44
++#define JS_AFFINITY_NEXT_LO     0x50
++#define JS_AFFINITY_NEXT_HI     0x54
++#define JS_CONFIG_NEXT          0x58
++#define JS_COMMAND_NEXT         0x60
++#define JS_STATUS_ACTIVE        0x08
++#define JS_COMMAND_START        1
++#define JS_COMMAND_HARD_STOP    3
++/* Thread priority 8, flush clean+invalidate at start and end (the GPU is
++ * not coherent), flush reduction (the G72 has it): Panfrost's JS_CONFIG. */
++#define A51_JS_CONFIG           ((8u << 16) | (3u << 8) | (3u << 12) | (1u << 14))
++#define MMU_IRQ_RAWSTAT         0x2000
++#define MMU_IRQ_CLEAR           0x2004
++#define AS0                     0x2400
++#define AS_TRANSTAB_LO          0x00
++#define AS_TRANSTAB_HI          0x04
++#define AS_MEMATTR_LO           0x08
++#define AS_MEMATTR_HI           0x0c
++#define AS_LOCKADDR_LO          0x10
++#define AS_LOCKADDR_HI          0x14
++#define AS_COMMAND              0x18
++#define AS_FAULTSTATUS          0x1c
++#define AS_FAULTADDRESS_LO      0x20
++#define AS_STATUS               0x28
++#define AS_COMMAND_UPDATE       1
++#define AS_COMMAND_LOCK         2
++#define AS_COMMAND_FLUSH_PT     4
++/* HeroGPU's AS0 values: table walk ADRMODE_TABLE | READ_INNER; MEMATTR. */
++#define A51_TRANSTAB_FLAGS      0x7u
++#define A51_MEMATTR             0x888d88u
+ 
+-static vm_offset_t a51_pmu, a51_gpu_base;
+-static int a51_gpu_mode = 1, a51_gpu_pretend_off;
++/* The GPU region (bank 1, outside XNU's RAM) and what lives in it. */
++#define A51_REGION_PA           0x8e0000000ull
++#define A51_REGION_MAPPED       0x800000u       /* of 64 MiB */
++#define R_L0                    0x0000u
++#define R_L1                    0x1000u
++#define R_L2_LOW                0x2000u         /* VA 0..1 GiB */
++#define R_L3_TEST               0x3000u
++#define R_L3_SCRATCH            0x4000u
++#define R_TEST                  0x10000u        /* 16 pages at A51_TEST_VA */
++#define R_TEST_PAGES            16u
++#define R_SCRATCH               0x200000u       /* 2 MiB at A51_SCRATCH_VA */
++#define R_L2_USER               0x400000u       /* VA 1..2 GiB */
++#define R_L3_USER               0x401000u       /* 512 tables, one per 2 MiB */
++#define A51_TEST_VA             0x02000000ull
++#define A51_SCRATCH_VA          0x0a000000ull
++#define A51_USER_VA             0x40000000ull
++#define A51_USER_BYTES          0x40000000ull
++#define A51_OUT_OFF             0x100u
++
++static vm_offset_t a51_pmu, a51_gpu_base, a51_region;
++static int a51_gpu_mode = 1, a51_gpu_pretend_off, a51_gpu_log;
+ static int a51_gpu_sleep;
++static int a51_gpu_state;               /* 0 not tried, 1 up, -1 failed */
++static bool a51_as_ok;                  /* AS0 programmed; cleared on recovery */
++static uint32_t a51_last_js_status;
++static struct a51_va_pool a51_va = { .base = A51_USER_VA, .size = A51_USER_BYTES };
++/* Serializes the GPU between the boot test and HeroGPU clients. */
++static LCK_GRP_DECLARE(a51_gpu_grp, "a51_gpu");
++static LCK_MTX_DECLARE(a51_gpu_mtx_store, &a51_gpu_grp);
++#define a51_gpu_mtx (&a51_gpu_mtx_store)
+ 
+ static uint32_t
+ a51_gpu_rd(uint32_t off)
+@@ -139,6 +226,310 @@ a51_gpu_cores_on(void)
+ 	       a51_gpu_power(TILER_PWRON_LO, TILER_READY_LO, a51_gpu_rd(TILER_PRESENT_LO), "tiler");
+ }
+ 
++static void
++a51_zero(vm_offset_t va, size_t bytes)
++{
++	volatile uint64_t *q = (volatile uint64_t *)va;
++	for (size_t i = 0; i < bytes / 8; i++) {
++		q[i] = 0;
++	}
++}
++
++static volatile uint64_t *
++a51_table(uint32_t off)
++{
++	return (volatile uint64_t *)(a51_region + off);
++}
++
++/* Four levels (L0..L3): test pages and scratch under the low L2, the user
++ * range under its own L2 with every L3 table present (empty). */
++static void
++a51_gpu_tables(void)
++{
++	a51_zero(a51_region, R_L3_USER + 512 * 0x1000);
++	a51_table(R_L0)[a51_pt_index(0, 0)] = a51_pte_table(A51_REGION_PA + R_L1);
++	a51_table(R_L1)[a51_pt_index(0, 1)] = a51_pte_table(A51_REGION_PA + R_L2_LOW);
++	a51_table(R_L1)[a51_pt_index(A51_USER_VA, 1)] = a51_pte_table(A51_REGION_PA + R_L2_USER);
++	a51_table(R_L2_LOW)[a51_pt_index(A51_TEST_VA, 2)] = a51_pte_table(A51_REGION_PA + R_L3_TEST);
++	a51_table(R_L2_LOW)[a51_pt_index(A51_SCRATCH_VA, 2)] = a51_pte_table(A51_REGION_PA + R_L3_SCRATCH);
++	for (unsigned i = 0; i < R_TEST_PAGES; i++) {
++		a51_table(R_L3_TEST)[i] = a51_pte_page(A51_REGION_PA + R_TEST + i * 0x1000ull);
++	}
++	for (unsigned i = 0; i < 512; i++) {
++		a51_table(R_L3_SCRATCH)[i] = a51_pte_page(A51_REGION_PA + R_SCRATCH + i * 0x1000ull);
++		a51_table(R_L2_USER)[i] = a51_pte_table(A51_REGION_PA + R_L3_USER + i * 0x1000ull);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a51_as_ok = false;
++}
++
++static bool
++a51_as_idle(void)
++{
++	for (unsigned i = 0; i < 10000; i++) {
++		if (!(a51_gpu_rd(AS0 + AS_STATUS) & 1)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* Lock a VA range and flush the MMU's page-table caches for it (kbase's
++ * mmu_hw_do_operation): LOCKADDR, LOCK, FLUSH_PT, each waited for. */
++static bool
++a51_mmu_flush(uint64_t va, unsigned log2_size)
++{
++	uint64_t lock = (va & ~((1ull << log2_size) - 1)) | (log2_size - 1);
++	if (!a51_as_idle()) {
++		return false;
++	}
++	a51_gpu_wr(AS0 + AS_LOCKADDR_LO, (uint32_t)lock);
++	a51_gpu_wr(AS0 + AS_LOCKADDR_HI, (uint32_t)(lock >> 32));
++	a51_gpu_wr(AS0 + AS_COMMAND, AS_COMMAND_LOCK);
++	if (!a51_as_idle()) {
++		return false;
++	}
++	a51_gpu_wr(AS0 + AS_COMMAND, AS_COMMAND_FLUSH_PT);
++	return a51_as_idle();
++}
++
++/* Hard-stop whatever is still on a slot (as kbase does); if a slot stays
++ * active, soft-reset the GPU and power it again. AS0 is reprogrammed by the
++ * next job. Without this one fault blocks every later job (S7 0249). */
++static void
++a51_gpu_recover(const char *what)
++{
++	static unsigned resets;
++	for (unsigned js = 0; js < 2; js++) {
++		if ((a51_gpu_rd(JS_BASE(js) + JS_STATUS) & 0xff) == JS_STATUS_ACTIVE) {
++			a51_gpu_wr(JS_BASE(js) + JS_COMMAND, JS_COMMAND_HARD_STOP);
++			for (unsigned i = 0; i < 1000 &&
++			    (a51_gpu_rd(JS_BASE(js) + JS_STATUS) & 0xff) == JS_STATUS_ACTIVE; i++) {
++				delay(10);
++			}
++		}
++	}
++	a51_gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	a51_gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	a51_as_ok = false;
++	if ((a51_gpu_rd(JS_BASE(0) + JS_STATUS) & 0xff) != JS_STATUS_ACTIVE &&
++	    (a51_gpu_rd(JS_BASE(1) + JS_STATUS) & 0xff) != JS_STATUS_ACTIVE) {
++		return;
++	}
++	bool done = a51_gpu_soft_reset();
++	bool up = a51_gpu_cores_on();
++	printf("A51 GPU: %s: soft reset #%u (%s), cores %s\n", what, ++resets,
++	    done ? "done" : "timed out", up ? "back up" : "NOT up");
++}
++
++/* Start the job chain at GPU VA jc on slot js on all shader cores and wait
++ * (bounded). True when it finished cleanly; otherwise logged and recovered. */
++static bool
++a51_gpu_run(unsigned js, uint64_t jc, const char *what)
++{
++	uint32_t slot = JS_BASE(js);
++	uint64_t start = mach_absolute_time(), ns;
++	a51_gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	a51_gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	if (!a51_as_ok) {
++		uint64_t transtab = A51_REGION_PA + R_L0 + A51_TRANSTAB_FLAGS;
++		a51_gpu_wr(AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++		a51_gpu_wr(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++		a51_gpu_wr(AS0 + AS_MEMATTR_LO, A51_MEMATTR);
++		a51_gpu_wr(AS0 + AS_MEMATTR_HI, 0);
++		a51_gpu_wr(AS0 + AS_COMMAND, AS_COMMAND_UPDATE);
++		if (!a51_as_idle()) {
++			printf("A51 GPU: %s: MMU update timeout\n", what);
++			return false;
++		}
++		a51_as_ok = true;
++	}
++	/* Client chains are written through write-combined mappings. */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a51_gpu_wr(slot + JS_HEAD_NEXT_LO, (uint32_t)jc);
++	a51_gpu_wr(slot + JS_HEAD_NEXT_HI, (uint32_t)(jc >> 32));
++	a51_gpu_wr(slot + JS_AFFINITY_NEXT_LO, a51_gpu_rd(SHADER_PRESENT_LO));
++	a51_gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
++	a51_gpu_wr(slot + JS_CONFIG_NEXT, A51_JS_CONFIG);
++	a51_gpu_wr(slot + JS_COMMAND_NEXT, JS_COMMAND_START);
++
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	for (unsigned i = 0; i < 20000; i++) {         /* 200 ms */
++		jirq = a51_gpu_rd(JOB_IRQ_RAWSTAT);
++		mirq = a51_gpu_rd(MMU_IRQ_RAWSTAT);
++		girq = a51_gpu_rd(GPU_IRQ_RAWSTAT);
++		if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++			break;
++		}
++		delay(10);
++	}
++	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
++	a51_last_js_status = a51_gpu_rd(slot + JS_STATUS);
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	if (!ok || a51_gpu_log) {
++		printf("A51 GPU: job js %u status %#x %llu us (%s) irq %#x mmu %#x gpu %#x "
++		    "head %#x%08x as_fault %#x@%#x gpu_fault %#x@%#x\n", js, a51_last_js_status,
++		    ns / 1000, what, jirq, mirq, girq, a51_gpu_rd(slot + JS_HEAD_HI),
++		    a51_gpu_rd(slot + JS_HEAD_LO), a51_gpu_rd(AS0 + AS_FAULTSTATUS),
++		    a51_gpu_rd(AS0 + AS_FAULTADDRESS_LO), a51_gpu_rd(GPU_FAULTSTATUS),
++		    a51_gpu_rd(GPU_FAULTADDR_LO));
++	}
++	a51_gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
++	a51_gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
++	if (!ok) {
++		a51_gpu_recover(what);
++	}
++	return ok;
++}
++
++/* Power, reset, map the region, build the tables. Called with the mutex. */
++static bool
++a51_gpu_bringup(void)
++{
++	if (a51_gpu_state != 0) {
++		return a51_gpu_state == 1;
++	}
++	a51_gpu_state = -1;
++	if (!a51_pmu || !a51_gpu_powered()) {
++		printf("A51 GPU: bring-up: G3D off\n");
++		return false;
++	}
++	if (!a51_gpu_base) {
++		a51_gpu_base = ml_io_map(A51_GPU_PA, A51_GPU_BYTES);
++	}
++	a51_region = ml_io_map((vm_offset_t)A51_REGION_PA, A51_REGION_MAPPED);
++	if (!a51_gpu_base || !a51_region) {
++		printf("A51 GPU: bring-up: mapping failed\n");
++		return false;
++	}
++	if (!a51_gpu_soft_reset() || !a51_gpu_cores_on()) {
++		return false;
++	}
++	a51_gpu_tables();
++	a51_gpu_state = 1;
++	printf("A51 GPU: ready shader %#x tiler %#x l2 %#x, user VA %#llx..%#llx\n",
++	    a51_gpu_rd(SHADER_READY_LO), a51_gpu_rd(TILER_READY_LO), a51_gpu_rd(L2_READY_LO),
++	    A51_USER_VA, A51_USER_VA + A51_USER_BYTES);
++	return true;
++}
++
++/* A job at an unmapped VA (recovery), then WRITE_VALUE zeroing 64 bits of
++ * a test page (the job HeroGPU first ran on the T880). */
++static void
++a51_gpu_boot_jobs(void)
++{
++	lck_mtx_lock(a51_gpu_mtx);
++	if (a51_gpu_state == 1) {
++		bool bad = a51_gpu_run(1, 0x7ff00000ull, "unmapped chain");
++		printf("A51 GPU: bad job js 1 status %#x %s\n", a51_last_js_status,
++		    bad ? "UNEXPECTEDLY OK" : "recovered");
++		vm_offset_t test = a51_region + R_TEST;
++		a51_zero(test, R_TEST_PAGES * 0x1000);
++		volatile uint8_t *job = (volatile uint8_t *)test;
++		job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
++		*(volatile uint16_t *)(job + 18) = 1;           /* index */
++		*(volatile uint64_t *)(job + 32) = A51_TEST_VA + A51_OUT_OFF;
++		*(volatile uint64_t *)(job + 40) = 3;           /* zero 64 bits */
++		volatile uint64_t *out = (volatile uint64_t *)(test + A51_OUT_OFF);
++		*out = 0xa5a5a5a55a5a5a5aull;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uint64_t start = mach_absolute_time(), ns;
++		bool ok = a51_gpu_run(1, A51_TEST_VA, "WRITE_VALUE") && *out == 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++		printf("A51 GPU: write_value %s %#llx in %llu us\n", ok ? "ok" : "FAILED",
++		    *out, ns / 1000);
++	}
++	lck_mtx_unlock(a51_gpu_mtx);
++}
++
++bool
++herolte_gpu_up(void)
++{
++	lck_mtx_lock(a51_gpu_mtx);
++	bool ok = a51_gpu_bringup();
++	lck_mtx_unlock(a51_gpu_mtx);
++	return ok;
++}
++
++/* A GPU register (GPU_ID, *_PRESENT, *_FEATURES...), for GetParam. */
++uint32_t
++herolte_gpu_reg(uint32_t off)
++{
++	if (a51_gpu_state != 1 || off >= 0x1000 || (off & 3)) {
++		return 0;
++	}
++	return a51_gpu_rd(off);
++}
++
++uint64_t
++herolte_gpu_va_alloc(uint64_t bytes)
++{
++	lck_mtx_lock(a51_gpu_mtx);
++	uint64_t va = a51_gpu_state == 1 ? a51_va_alloc(&a51_va, bytes) : 0;
++	lck_mtx_unlock(a51_gpu_mtx);
++	return va;
++}
++
++/* PTEs for n 4 KiB pages at va (pages == NULL: unmap), then an MMU flush. */
++static bool
++a51_user_set_locked(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t a = va + (uint64_t)i * 0x1000;
++		if (a < A51_USER_VA || a >= A51_USER_VA + A51_USER_BYTES) {
++			return false;
++		}
++		volatile uint64_t *l3 = a51_table(R_L3_USER + a51_pt_index(a, 2) * 0x1000u);
++		l3[a51_pt_index(a, 3)] = pages ? a51_pte_page(pages[i]) : 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return a51_mmu_flush(A51_USER_VA, 30);
++}
++
++bool
++herolte_gpu_map(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	lck_mtx_lock(a51_gpu_mtx);
++	bool ok = a51_gpu_state == 1 && a51_user_set_locked(va, pages, n);
++	lck_mtx_unlock(a51_gpu_mtx);
++	return ok;
++}
++
++void
++herolte_gpu_unmap(uint64_t va, unsigned n)
++{
++	lck_mtx_lock(a51_gpu_mtx);
++	if (a51_gpu_state == 1) {
++		(void)a51_user_set_locked(va, NULL, n);
++		a51_va_free(&a51_va, va, (uint64_t)n * 0x1000);
++	}
++	lck_mtx_unlock(a51_gpu_mtx);
++}
++
++/* Run the chain at GPU VA jc on slot js (0 fragment, 1 the rest). Returns 0
++ * when it finished cleanly, else JS_STATUS (~0 if it never ran); *us = time. */
++uint32_t
++herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
++{
++	if (js > 1 || jc == 0) {
++		return ~0u;
++	}
++	lck_mtx_lock(a51_gpu_mtx);
++	uint32_t status = ~0u;
++	if (a51_gpu_state == 1) {
++		uint64_t start = mach_absolute_time(), ns;
++		bool ok = a51_gpu_run(js, jc, js ? "HeroGPU JS1" : "HeroGPU JS0");
++		status = ok ? 0 : (a51_last_js_status ? a51_last_js_status : ~0u);
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++		if (us) {
++			*us = ns / 1000;
++		}
++	}
++	lck_mtx_unlock(a51_gpu_mtx);
++	return status;
++}
++
+ static void
+ a51_gpu_report(void)
+ {
+@@ -163,14 +554,9 @@ a51_gpu_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	a51_gpu_report();
+-	if (a51_gpu_mode < 2) {
+-		return;
++	if (a51_gpu_mode >= 2 && herolte_gpu_up() && a51_gpu_mode >= 3) {
++		a51_gpu_boot_jobs();
+ 	}
+-	if (!a51_gpu_soft_reset() || !a51_gpu_cores_on()) {
+-		return;
+-	}
+-	printf("A51 GPU: ready shader %#x tiler %#x l2 %#x\n", a51_gpu_rd(SHADER_READY_LO),
+-	    a51_gpu_rd(TILER_READY_LO), a51_gpu_rd(L2_READY_LO));
+ }
+ 
+ void
+@@ -180,6 +566,7 @@ a51_gpu_probe(void)
+ 
+ 	PE_parse_boot_argn("a51gpu", &a51_gpu_mode, sizeof(a51_gpu_mode));
+ 	PE_parse_boot_argn("a51gpu_pretend_off", &a51_gpu_pretend_off, sizeof(a51_gpu_pretend_off));
++	PE_parse_boot_argn("a51gpulog", &a51_gpu_log, sizeof(a51_gpu_log));
+ 	if (a51_gpu_mode <= 0) {
+ 		return;
+ 	}
