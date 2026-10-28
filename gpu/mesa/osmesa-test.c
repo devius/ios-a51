@@ -3,9 +3,9 @@
  * OSMesa with the Panfrost screen (gpu/mesa/hero_hw.c) renders a cleared
  * frame with a triangle into memory, checks pixels and times frames.
  *
- *   /private/var/root/gpu/osmesa-test [FRAMES]     (default 300)
+ *   /private/var/a51gpu/osmesa-test [FRAMES]     (default 300)
  *
- * Run over SSH; the dylibs are in /private/var/root/gpu/lib (rpath). Output
+ * Run over SSH; the dylibs are in /private/var/a51gpu/lib (rpath). Output
  * goes to stdout and to the kernel log (herodrm_log). HERO_GPU=0 runs on
  * softpipe for comparison. Exit 0 only when the pixels are right and, unless
  * HERO_GPU=0, the renderer is Panfrost: a silent softpipe fallback fails (2),

@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Every boot-partition write needs the owner's approval; reboots without a write do not.
-- Shim and Mesa live in `/private/var/root/gpu/lib`; shim `libheroeagl.dylib`.
+- Shim and Mesa live in `/private/var/a51gpu/lib`; shim `libheroeagl.dylib`.
 - Shim starts with `BGL_NODIRECT=1 HERO_GPU_BLIT=0`; direct paths enabled one at a time later.
 - dyld policy answer only for process name `backboardd`, only its first 2 launches per boot, never when `a51gl=0`; flags `(1<<0)|(1<<1)|(1<<5)`; every other caller gets `ENOPOLICY` (as with no policy).
 - No black areas: Reduce Transparency on for backboardd.
@@ -48,7 +48,7 @@
 
 **Files:** `gpu/eagl/**` from the S7 (`build-eagl.sh`, `NOTICE.md`, `src/*`, `test/*`, `tools/gen_gl_stubs.py`); `hero_backboardd.c` + Reduce Transparency; `check-eagl.sh`; `mac-mesa.sh` runs `build-eagl.sh` after `build-mesa.sh`.
 
-- [ ] **Step 1:** `check-eagl.sh`: no `herolte|/private/var/herolte|Galaxy S7's` outside attribution lines; rpath `/private/var/root/gpu/lib`; `hero_backboardd.c` sets `EnhancedBackgroundContrastEnabled`; NOTICE kept. Run → FAIL.
+- [ ] **Step 1:** `check-eagl.sh`: no `herolte|/private/var/herolte|Galaxy S7's` outside attribution lines; rpath `/private/var/a51gpu/lib`; `hero_backboardd.c` sets `EnhancedBackgroundContrastEnabled`; NOTICE kept. Run → FAIL.
 - [ ] **Step 2:** Port (S7 HEAD revision), rename paths, add the Reduce Transparency preference (in the `com.apple.Accessibility` domain, `kCFPreferencesAnyUser`… as `hero_backboardd.c`'s existing calls do for its app domain).
 - [ ] **Step 3:** `check-eagl.sh` passes; `mac-mesa.sh ../build/mesa3` → `lib/libheroeagl.dylib`, `eagl_ca_test`; `otool -L` only `@rpath`/system.
 - [ ] **Step 4:** Commit.

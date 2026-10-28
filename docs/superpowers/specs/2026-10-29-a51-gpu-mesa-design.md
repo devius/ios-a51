@@ -78,7 +78,7 @@ second; the same program with the software renderer gives the comparison.
    `herodrm.c`, `hero_hw.c`, `osmesa_hero.inc`, `osmesa-test.c`) into
    `gpu/mesa/` here; Mesa `mesa-25.0.7`, libdrm `libdrm-2.4.124`, the S7's
    pins. Changes from the S7: comments and names (Mali-G72, A51), the install
-   path (`/private/var/root/gpu/lib` instead of the S7's drop zone
+   path (`/private/var/a51gpu/lib` instead of the S7's drop zone
    `/private/var/herolte/lib`; rpath and `ERR_PATH` follow), and nothing
    Midgard-specific left in the patches (checked when porting; Mesa builds
    the Bifrost back end for Panfrost by default).
@@ -89,8 +89,8 @@ second; the same program with the software renderer gives the comparison.
    `gpu/mesa/` to the VM, runs `build-mesa.sh` there and fetches `OUTDIR`
    (`lib/libOSMesa.8.dylib`, `lib/libglapi.0.dylib`, `lib/libdrm.2.dylib`,
    `osmesa-test`, `SHA256SUMS`), mirroring `mac-kernel.sh`.
-3. **On the phone:** `scp` the dylibs to `/private/var/root/gpu/lib` and
-   `osmesa-test` to `/private/var/root/gpu/`; run it over SSH. Its stdout and
+3. **On the phone:** `scp` the dylibs to `/private/var/a51gpu/lib` and
+   `osmesa-test` to `/private/var/a51gpu/`; run it over SSH. Its stdout and
    the kernel log (`HeroGPU` Log, job lines with `a51gpulog=1`) both reach the
    PC.
 4. **What `osmesa-test` reports:** the renderer string (`GL_RENDERER` must

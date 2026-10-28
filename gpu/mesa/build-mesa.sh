@@ -6,7 +6,7 @@
 #   build-mesa.sh WORK OUT
 #
 # OUT gets lib/{libOSMesa.8,libglapi.0,libdrm.2}.dylib (install names
-# @rpath/...) and osmesa-test (rpath /private/var/root/gpu/lib), all ad-hoc
+# @rpath/...) and osmesa-test (rpath /private/var/a51gpu/lib), all ad-hoc
 # signed. Nothing of Apple's is in OUT.
 set -euo pipefail
 
@@ -108,7 +108,7 @@ for lib in "$OUT"/lib/*.dylib; do
 done
 
 $CC_IOS -O2 -Wall -I mesa/include -o "$OUT/osmesa-test" "$HERE/osmesa-test.c" \
-  -L "$OUT/lib" -lOSMesa.8 -ldrm.2 -Wl,-rpath,/private/var/root/gpu/lib
+  -L "$OUT/lib" -lOSMesa.8 -ldrm.2 -Wl,-rpath,/private/var/a51gpu/lib
 
 for f in "$OUT"/lib/*.dylib "$OUT/osmesa-test"; do
   codesign -s - -f "$f"

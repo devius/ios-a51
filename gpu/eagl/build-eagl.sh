@@ -27,7 +27,7 @@ $CC $CF -fno-objc-arc -fobjc-exceptions -DEAGL_INJECT -c "$HERE/src/eagl.m" -o "
 $CC -dynamiclib -o "$OUT/lib/libheroeagl.dylib" "$OBJ"/{gl_stubs,gl_resolve,gl_unimpl,osm,macro_ctx,macro_slots,hero_log,hero_backboardd,eagl}.o \
   -install_name @rpath/libheroeagl.dylib \
   -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework IOSurface \
-  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/root/gpu/lib -Wl,-undefined,error
+  -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/a51gpu/lib -Wl,-undefined,error
 
 # The CoreAnimation test links the SDK's OpenGLES and QuartzCore; EAGL_INJECT_LIB names the shim.
 $CC -O1 -g -Wno-deprecated-declarations -fno-objc-arc -I"$HERE/src" "$HERE/test/eagl_ca_test.m" \

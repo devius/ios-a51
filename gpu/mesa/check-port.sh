@@ -26,7 +26,7 @@ grep -q 'ERR_PATH' "$t" && { echo "FAIL: osmesa-test.c still uses ERR_PATH"; exi
 grep -q 'GL_RENDERER' "$t" && grep -q 'fps' "$t" || { echo "FAIL: osmesa-test.c lacks GL_RENDERER/fps"; exit 1; }
 clang -fsyntax-only -Wall -Wno-format -I "$tree/include" "$t"
 # Final review (2026-10-29): a failed GPU job must not pass silently.
-grep -q 'herodrm_fault_count' herodrm.c && grep -qE 'out\[0\].*fail\(EIO\)|fail\(EIO\).*out\[0\]' <(sed -n '/^submit(/,/^}/p' "$here/herodrm.c") ||
+grep -q 'herodrm_fault_count' "$here/herodrm.c" && grep -qE 'out\[0\].*fail\(EIO\)|fail\(EIO\).*out\[0\]' <(sed -n '/^submit(/,/^}/p' "$here/herodrm.c") ||
 	{ echo "FAIL: herodrm submit() does not report a failed job (EIO + herodrm_fault_count)"; exit 1; }
 grep -q 'herodrm_fault_count()' "$t" && grep -q 'rc = 3' "$t" ||
 	{ echo "FAIL: osmesa-test does not exit 3 after GPU job faults"; exit 1; }

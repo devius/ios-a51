@@ -40,7 +40,7 @@ static void *pump(void *arg) {
 // Extra KEY=VALUE lines for the shim (debug and trace switches) from the drop zone, so they change without a new
 // kernel: the kernel only sets DYLD_INSERT_LIBRARIES and HERO_LOG_STDERR.
 static void load_gl_env(void) {
-    FILE *f = fopen("/private/var/root/gpu/gl.env", "r");
+    FILE *f = fopen("/private/var/a51gpu/gl.env", "r");
     char line[256];
     while (f && fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;

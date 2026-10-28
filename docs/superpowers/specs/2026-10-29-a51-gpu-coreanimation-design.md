@@ -59,7 +59,7 @@ with Bergamota's EAGL shim (MIT) over Mesa. Goal: the UI draws on the GPU.
   `sweetusb=2 a5fb_keep_on=1 a5fb_noconsole=1 sweetfb_hz=30 a51gpu=3`;
   every boot write needs the owner's approval.
 - Mesa: `gpu/mesa` (Mesa 25.0.7, libOSMesa + libdrm stand-in), installed in
-  `/private/var/root/gpu/lib`, built on the Mac VM (`mac-mesa.sh`).
+  `/private/var/a51gpu/lib`, built on the Mac VM (`mac-mesa.sh`).
 - Kernel builds on the Mac VM (`mac-kernel.sh`, ~3 min); GitHub runners are not
   available.
 - The loader's dead-man timer resets even a healthy boot into TWRP after 15 min.
@@ -79,7 +79,7 @@ with Bergamota's EAGL shim (MIT) over Mesa. Goal: the UI draws on the GPU.
    screen is correct. Copy it (Bergamota's shim, MIT, with its
    NOTICE; the S7's changes: `eagl_macro_ensure`, `EAGL_TRACE_ON`) into
    `gpu/eagl/`, renamed for the A51 and installed as
-   `/private/var/root/gpu/lib/libheroeagl.dylib` (rpath to the Mesa dylibs).
+   `/private/var/a51gpu/lib/libheroeagl.dylib` (rpath to the Mesa dylibs).
    Built on the Mac VM after Mesa (`mac-mesa.sh` grows the EAGL step).
    Includes the S7's `hero_backboardd.c` (8-bit BGRA display: deep and
    compressed framebuffers off; without it the S7's panel stayed black) and
