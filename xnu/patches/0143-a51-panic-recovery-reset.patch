@@ -1,0 +1,72 @@
+A51: a panic warm-resets into recovery.
+
+Panics on the A51 hung after the panic log ("handshake structure not
+initialized": no kernel core), so boots 40 and 41 sat frozen until the
+shim's 15-minute dead-man timer. Right after SavePanicInfo the A51 now does
+the touch gesture's warm reset (PMU INFORM magic, SWRESET) into TWRP;
+pstore keeps the panic log. The PMU is mapped at boot by the touch probe.
+Boot-arg a51panicreset=0 restores the old behaviour.
+
+diff --git i/bsd/dev/a5xelte_touch.c w/bsd/dev/a5xelte_touch.c
+index 0ed1b3e..8720392 100644
+--- i/bsd/dev/a5xelte_touch.c
++++ w/bsd/dev/a5xelte_touch.c
+@@ -1306,9 +1306,40 @@ a51_touch_start(void)
+ }
+ #endif /* A51 */
+ 
++/*
++ * Panic -> the same warm reset into recovery (osfmk/kern/debug.c, right after
++ * the panic log is saved; pstore keeps it). Without it a panic on the A51
++ * hangs ("handshake structure not initialized", no kernel core) until the
++ * shim's 15-minute dead-man timer (boots 40, 41). The PMU is mapped here at
++ * boot: nothing may be mapped during a panic. Boot-arg a51panicreset=0: off.
++ */
++static vm_offset_t a51_panic_pmu;
++void a51_panic_recovery_reset(void);
++
++void
++a51_panic_recovery_reset(void)
++{
++	if (a51_panic_pmu == 0) {
++		return;
++	}
++	delay(100000);                  /* let the console drain to the ramoops mirror */
++	a5touch_write(a51_panic_pmu, 0x808, 0x12345678u);
++	a5touch_write(a51_panic_pmu, 0x80c, 0x12345674u);
++	a5touch_write(a51_panic_pmu, 0x908, 0x12345678u);
++	a5touch_write(a51_panic_pmu, 0x90c, 0x12345674u);
++	a5touch_write(a51_panic_pmu, 0x400, 1u);  /* EXYNOS_SWRESET */
++}
++
+ void
+ a5xelte_touch_probe(void)
+ {
++#if defined(A51)
++	int panic_reset = 1;
++	(void)PE_parse_boot_argn("a51panicreset", &panic_reset, sizeof(panic_reset));
++	if (panic_reset) {
++		a51_panic_pmu = ml_io_map(0x11860000u, 0x1000);
++	}
++#endif
+ #if defined(DREAMLTE)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
+ #endif
+diff --git i/osfmk/kern/debug.c w/osfmk/kern/debug.c
+index aec20a6..83d62d1 100644
+--- i/osfmk/kern/debug.c
++++ w/osfmk/kern/debug.c
+@@ -1309,6 +1309,13 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 		 * hooked up for embedded
+ 		 */
+ 		SavePanicInfo(debugger_message, debugger_panic_data, debugger_panic_options);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		{
++			/* A51: warm reset into recovery now (bsd/dev/a5xelte_touch.c). */
++			extern void a51_panic_recovery_reset(void);
++			a51_panic_recovery_reset();
++		}
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 		INJECT_NESTED_PANIC_IF_REQUESTED(PANIC_TEST_CASE_RECURPANIC_POSTLOG);

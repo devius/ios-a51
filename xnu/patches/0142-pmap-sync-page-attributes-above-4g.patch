@@ -1,0 +1,26 @@
+pmap: flush page attributes above 4 GiB (S7 patch 0242).
+
+pmap_sync_page_attributes_phys() shifted the page number in 32 bits, which
+drops the high bits of RAM above 4 GiB; the A51's RAM (like the S7's bank
+2) is at 0x880000000. On the S7 a write-combined user mapping (HeroGPU
+MapBO) panicked in phystokv. Boot 41 hung right after herogpu-test read
+its GPU params, its next calls being CreateBO and the write-combined MapBO.
+Use ptoa().
+
+diff --git i/osfmk/arm/pmap/pmap.c w/osfmk/arm/pmap/pmap.c
+index 00568d3..c3e5ae0 100644
+--- i/osfmk/arm/pmap/pmap.c
++++ w/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,11 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* ptoa(), not pp << PAGE_SHIFT: that shift is done in 32 bits and
++	 * drops the high bits of RAM above 4 GiB (the A51's and the S7's RAM is
++	 * at 0x880000000; a write-combined user mapping panicked in phystokv on
++	 * the S7, patch 0242 there). */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
