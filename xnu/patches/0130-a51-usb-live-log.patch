@@ -24,7 +24,12 @@ path first releases the PMU isolation (pmu_mask 0x3, Samsung
 exynos_usbdrd_phy_isol(on = 0)) and runs the HS power-up of USBCON v3.0 from
 the same bootloader (phy_exynos_usb_v3p1_enable): force q-channel, link
 reset, PHY reset high, SIDDQ off, UTMI suspend/sleep/pulldowns off, PHY
-clock on, PHY reset low, then the VBUS force.
+Boot 28 with the PHY powered still never connected (DSTS running, no host
+event). Add the DWC3 side of the same bring-up (lk3rd usbd3-ss.c): hold
+GUSB2PHYCFG.PHYSOFTRST while the PHY powers up, clear SUSPHY/ENBLSLPM and
+U2_FREECLK_EXISTS (DT snps,dis-u2-freeclk-exists-quirk), clear
+GUSB3PIPECTL.SUSPHY, pulse GCTL.CORESOFTRESET with U2RSTECN, then
+GSBUSCFG0 0x22220000|INCR16 and USBTRDTIM 9.
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index ea1d3c1..d72a36d 100644
@@ -41,7 +46,7 @@ index ea1d3c1..d72a36d 100644
  	return 0;
  }
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..631156c 100644
+index b6c1a41..df261d1 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -10,7 +10,7 @@
@@ -160,7 +165,23 @@ index b6c1a41..631156c 100644
  }
  
  /*
-@@ -848,6 +908,75 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -147,6 +207,15 @@ sweet_usb_probe(void)
+  * ep0.c).
+  */
+ #define GCTL            0xc110
++#define GCTL_CORESOFTRESET      (1u << 11)
++#define GCTL_U2RSTECN           (1u << 16)
++#define GUSB2PHYCFG     0xc200
++#define GUSB2PHYCFG_PHYSOFTRST  (1u << 31)
++#define GUSB2PHYCFG_U2_FREECLK_EXISTS (1u << 30)
++#define GUSB2PHYCFG_ENBLSLPM    (1u << 8)
++#define GUSB2PHYCFG_SUSPHY      (1u << 6)
++#define GUSB3PIPECTL    0xc2c0
++#define GUSB3PIPECTL_SUSPHY     (1u << 17)
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+@@ -848,6 +917,75 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  }
  
@@ -236,17 +257,39 @@ index b6c1a41..631156c 100644
  static void
  sweet_usb_gadget_start(vm_offset_t dwc)
  {
-@@ -866,6 +995,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -866,6 +1004,31 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	ud.dma_pa = ptoa_64(pn);
  	ud_if_create();
  
 +#if defined(A51)
++	/*
++	 * DWC3 side of Samsung's 9610 bring-up (lk3rd usbd3-ss.c): hold the USB2
++	 * PHY interface in reset while the PHY powers up, take the PHYs out of
++	 * suspend, drop U2_FREECLK_EXISTS (DT snps,dis-u2-freeclk-exists-quirk),
++	 * then reset the whole core once the PHY clock runs. Boot 28 powered the
++	 * PHY and ran the device controller without these and never connected.
++	 */
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) | GUSB2PHYCFG_PHYSOFTRST);
 +	a51_usb_phy_enable();
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~GUSB2PHYCFG_PHYSOFTRST);
++	delay(75);
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) &
++	    ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM | GUSB2PHYCFG_U2_FREECLK_EXISTS));
++	dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) & ~GUSB3PIPECTL_SUSPHY);
++	dwc_wr(GCTL, dwc_rd(GCTL) | GCTL_CORESOFTRESET | GCTL_U2RSTECN);
++	delay(1000);
++	dwc_wr(GCTL, dwc_rd(GCTL) & ~GCTL_CORESOFTRESET);
++	delay(1000);
++	/* Bus: cacheable/modifiable requests, INCR16 bursts (9610 bootloader). */
++	dwc_wr(0xc100 /* GSBUSCFG0 */, 0x22220000u | (1u << 3));
++	dwc_wr(GUSB2PHYCFG, (dwc_rd(GUSB2PHYCFG) & ~(0xfu << 10)) | (9u << 10));    /* USBTRDTIM 9 */
++	printf("SWEET USB: A51 core reset: GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(0xc118), dwc_rd(DSTS));
 +#endif
  	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
  	dwc_wr(DCTL, DCTL_CSFTRST);
  	int i;
-@@ -902,7 +1034,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -902,7 +1065,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(DALEPENA, 0x3);
  	ud_start_setup();
  
@@ -258,7 +301,7 @@ index b6c1a41..631156c 100644
  	if (qs != 0) {
  		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
  		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
-@@ -928,4 +1064,4 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -928,4 +1095,4 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  		thread_deallocate(thread);
  	}
  }
