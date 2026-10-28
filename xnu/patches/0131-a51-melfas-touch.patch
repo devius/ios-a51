@@ -1,0 +1,285 @@
+A51: Melfas MSS100 touch over the classic Samsung IIC.
+
+The A51's touchscreen is a Melfas MSS100 (MIP4) at 0x48 on i2c@13870000
+(classic s3c2440-style IIC, not HSI2C). shim/a51 probes on a second SM-A515F:
+S-Boot leaves the 3.0 V supply tsp_ldo_en (gpg3-1) undriven and the bus pins
+(gpp1-0/1) as inputs, so the chip does not ACK; with gpg3-1 driven high and
+150 ms POWER_ON_DELAY it answers: product "A51", event format 0x0a (16-byte
+events), size 16, size type 1, ready 0xa0.
+
+a51_touch_start() (from a5xelte_touch_probe, boot-arg a51touch=0 to disable)
+sets the pins, powers the chip, checks it, and starts a worker that polls the
+interrupt line gpa0-0 (low while events are queued) like the S8 path, reads
+EVENT/PACKET_INFO then EVENT/PACKET_DATA, decodes EVENT_FORMAT_16BYTE records
+(A51 kernel melfas_mss100_mod.c) and feeds sweet_hid_touch() on
+SweetHIDTouch's 1080x1920 grid. The IIC sequence is Samsung's bootloader
+driver (lk3rd dev/i2c/exynos_i2c.c), polled.
+
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index ba647a8..359354d 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -920,11 +920,263 @@ dreamlte_touch_start(void)
+ }
+ #endif /* DREAMLTE */
+ 
++#if defined(A51)
++/*
++ * Galaxy A51 touch: Melfas MSS100 (MIP4) at 0x48 on the classic Samsung IIC at
++ * 0x13870000 (live DT i2c@13870000 / mms_ts@48, event_info <0x0a 0x10 0x01>:
++ * 16-byte events, packet-info byte counts events). S-Boot leaves the 3.0 V
++ * supply tsp_ldo_en (gpg3-1) undriven and the bus pins (gpp1-0/1) as inputs;
++ * shim/a51 probes showed no ACK until gpg3-1 is driven high, then product
++ * "A51", format 0x0a / size 16 / type 1, ready 0xa0. The interrupt line
++ * gpa0-0 is low while events are queued; it is polled like the S8's.
++ * IIC sequence: Samsung's bootloader driver (lk3rd dev/i2c/exynos_i2c.c),
++ * proven in shim/a51/muic.c; event layout: A51 kernel melfas_mss100_mod.c
++ * (EVENT_FORMAT_16BYTE).
++ */
++#define A51TS_IIC_PA            0x13870000u
++#define A51TS_GPIO_PA           0x139b0000u     /* pinctrl@139B0000 */
++#define A51TS_GPP1CON           0x020u          /* gpp1-0 SDA, gpp1-1 SCL */
++#define A51TS_GPG3CON           0x120u          /* gpg3-1 tsp_ldo_en */
++#define A51TS_GPG3DAT           0x124u
++#define A51TS_ALIVE_PA          0x11850000u     /* pinctrl@11850000 */
++#define A51TS_GPA0DAT           0x004u          /* gpa0-0 touch interrupt */
++#define A51TS_ADDR              0x48u
++#define A51TS_FINGERS           10
++#define A51TS_EVENT_SIZE        16u
++
++#define IICCON                  0x00u
++#define IICSTAT                 0x04u
++#define IICDS                   0x0cu
++#define IICCON_ACKEN            (1u << 7)
++#define IICCON_TXDIV512         (1u << 6)
++#define IICCON_IRQEN            (1u << 5)
++#define IICCON_IRQPEND          (1u << 4)
++#define IICSTAT_MASTER_RX       (2u << 6)
++#define IICSTAT_MASTER_TX       (3u << 6)
++#define IICSTAT_START           (1u << 5)
++#define IICSTAT_TXRXEN          (1u << 4)
++#define IICSTAT_LASTBIT         (1u << 0)
++
++static vm_offset_t a51ts_iic, a51ts_gpio, a51ts_alive;
++static int a51ts_sleep;
++static bool a51ts_down[A51TS_FINGERS];
++static uint16_t a51ts_x[A51TS_FINGERS], a51ts_y[A51TS_FINGERS];
++
++static int
++a51iic_wait(void)
++{
++	for (int i = 0; i < 5000; i++) {
++		if (a5touch_read(a51ts_iic, IICCON) & IICCON_IRQPEND) {
++			return 0;
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++static void
++a51iic_resume(void)
++{
++	a5touch_write(a51ts_iic, IICCON, a5touch_read(a51ts_iic, IICCON) & ~IICCON_IRQPEND);
++}
++
++static void
++a51iic_stop(uint32_t mode)
++{
++	a5touch_write(a51ts_iic, IICSTAT, mode | IICSTAT_TXRXEN);
++	a51iic_resume();
++	for (int i = 0; i < 400 && (a5touch_read(a51ts_iic, IICSTAT) & IICSTAT_START); i++) {
++		delay(10);
++	}
++}
++
++/* For a read's second message the previous IRQPEND is still set: program
++ * the new START first, then clear it (bootloader i2c_message_start()). */
++static int
++a51iic_start(uint32_t mode, uint8_t addr_byte, bool restart)
++{
++	if (!restart) {
++		for (int i = 0; i < 400 && (a5touch_read(a51ts_iic, IICSTAT) & IICSTAT_START); i++) {
++			delay(10);
++		}
++	}
++	a5touch_write(a51ts_iic, IICSTAT, mode | IICSTAT_TXRXEN);
++	*(volatile uint8_t *)(a51ts_iic + IICDS) = addr_byte;
++	delay(1);
++	a5touch_write(a51ts_iic, IICCON, a5touch_read(a51ts_iic, IICCON) | IICCON_ACKEN | IICCON_IRQEN);
++	a5touch_write(a51ts_iic, IICSTAT, mode | IICSTAT_TXRXEN | IICSTAT_START);
++	a51iic_resume();
++	if (a51iic_wait()) {
++		return -1;
++	}
++	return (mode == IICSTAT_MASTER_TX && (a5touch_read(a51ts_iic, IICSTAT) & IICSTAT_LASTBIT)) ? -2 : 0;
++}
++
++/* Write the two MIP4 register bytes, then read rlen bytes. */
++static bool
++a51ts_read(uint8_t r0, uint8_t r1, uint8_t *buf, unsigned rlen)
++{
++	const uint8_t w[2] = { r0, r1 };
++	int e = a51iic_start(IICSTAT_MASTER_TX, A51TS_ADDR << 1, false);
++	for (unsigned i = 0; !e && i < 2; i++) {
++		*(volatile uint8_t *)(a51ts_iic + IICDS) = w[i];
++		delay(1);
++		a51iic_resume();
++		e = a51iic_wait() ? -1 : ((a5touch_read(a51ts_iic, IICSTAT) & IICSTAT_LASTBIT) ? -2 : 0);
++	}
++	if (!e) {
++		e = a51iic_start(IICSTAT_MASTER_RX, (A51TS_ADDR << 1) | 1, true);
++	}
++	for (unsigned i = 0; !e && i < rlen; i++) {
++		if (i == rlen - 1) {
++			a5touch_write(a51ts_iic, IICCON, a5touch_read(a51ts_iic, IICCON) & ~IICCON_ACKEN);
++		}
++		a51iic_resume();
++		e = a51iic_wait();
++		if (!e) {
++			buf[i] = *(volatile uint8_t *)(a51ts_iic + IICDS);
++		}
++	}
++	a51iic_stop(e ? IICSTAT_MASTER_TX : IICSTAT_MASTER_RX);
++	return e == 0;
++}
++
++static void
++a51ts_report(const uint8_t *p)
++{
++	if ((p[0] & 3u) != 1u) {                /* MIP4_EVENT_INPUT_TYPE_SCREEN */
++		return;
++	}
++	int id = (int)((p[0] >> 2) & 0x0fu) - 1;
++	unsigned state = p[0] >> 6;             /* 1 press, 2 move, 3 release */
++	if (id < 0 || id >= A51TS_FINGERS) {
++		return;
++	}
++	/* 12-bit panel coordinates onto SweetHIDTouch's 1080x1920 grid. */
++	unsigned x = (((unsigned)p[1] << 4) | (p[3] >> 4)) * 1080u / 4096u;
++	unsigned y = (((unsigned)p[2] << 4) | (p[3] & 0x0fu)) * 1920u / 4096u;
++	if (state == 1 || state == 2) {
++		if (!a51ts_down[id]) {
++			printf("A51 TOUCH: down id=%d x=%u y=%u\n", id, x, y);
++		}
++		a51ts_down[id] = true;
++		a51ts_x[id] = (uint16_t)x;
++		a51ts_y[id] = (uint16_t)y;
++		if (id < 5) {
++			sweet_hid_touch(id, 1, (int)x, (int)y);
++		}
++	} else if (state == 3 && a51ts_down[id]) {
++		a51ts_down[id] = false;
++		if (id < 5) {
++			sweet_hid_touch(id, 0, a51ts_x[id], a51ts_y[id]);
++		}
++	}
++}
++
++static void
++a51ts_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a51ts_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++a51ts_thread(void *arg, wait_result_t result)
++{
++	uint8_t buf[A51TS_EVENT_SIZE * A51TS_FINGERS];
++	uint8_t info;
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	printf("A51 TOUCH: worker started\n");
++	for (;;) {
++		if (a5touch_read(a51ts_alive, A51TS_GPA0DAT) & 1u) {   /* INT high: idle */
++			a51ts_wait(8);
++			continue;
++		}
++		if (!a51ts_read(0x02, 0x10, &info, 1)) {               /* EVENT / PACKET_INFO */
++			if (++errors <= 8 || !(errors & 255)) {
++				printf("A51 TOUCH: packet info read failed (%u)\n", errors);
++			}
++			a51ts_wait(20);
++			continue;
++		}
++		unsigned size = (info & 0x80u) ? (info & 0x7fu) : (info & 0x7fu) * A51TS_EVENT_SIZE;
++		if (size == 0 || size > sizeof(buf)) {
++			size = sizeof(buf);
++		}
++		if (!a51ts_read(0x02, 0x11, buf, size)) {              /* EVENT / PACKET_DATA */
++			a51ts_wait(20);
++			continue;
++		}
++		errors = 0;
++		if (info & 0x80u) {                    /* alert (mode state, ESD, ...) */
++			printf("A51 TOUCH: alert %#x size %u\n", buf[0], size);
++			continue;
++		}
++		for (unsigned i = 0; i + A51TS_EVENT_SIZE <= size; i += A51TS_EVENT_SIZE) {
++			a51ts_report(buf + i);
++		}
++	}
++}
++
++static void
++a51_touch_start(void)
++{
++	thread_t thread;
++	int enabled = 1;
++	uint8_t name[4] = {0}, fmt[4] = {0};
++	(void)PE_parse_boot_argn("a51touch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("A51 TOUCH: disabled\n");
++		return;
++	}
++	a51ts_iic = ml_io_map(A51TS_IIC_PA, 0x1000);
++	a51ts_gpio = ml_io_map(A51TS_GPIO_PA, 0x1000);
++	a51ts_alive = ml_io_map(A51TS_ALIVE_PA, 0x1000);
++	if (!a51ts_iic || !a51ts_gpio || !a51ts_alive) {
++		printf("A51 TOUCH: MMIO mapping failed\n");
++		return;
++	}
++	/* Bus pins to I2C, supply on (POWER_ON_DELAY 150 ms), as the shim probe. */
++	uint32_t con = a5touch_read(a51ts_gpio, A51TS_GPP1CON);
++	if ((con & 0xffu) != 0x22u) {
++		a5touch_write(a51ts_gpio, A51TS_GPP1CON, (con & ~0xffu) | 0x22u);
++	}
++	if (!(a5touch_read(a51ts_gpio, A51TS_GPG3DAT) & 2u)) {
++		a5touch_write(a51ts_gpio, A51TS_GPG3CON, (a5touch_read(a51ts_gpio, A51TS_GPG3CON) & ~0xf0u) | 0x10u);
++		a5touch_write(a51ts_gpio, A51TS_GPG3DAT, a5touch_read(a51ts_gpio, A51TS_GPG3DAT) | 2u);
++		delay(200000);
++	}
++	con = a5touch_read(a51ts_iic, IICCON);
++	if ((con & 0x4fu) == 0) {
++		a5touch_write(a51ts_iic, IICCON, con | IICCON_TXDIV512 | 0xf);
++	}
++	if (!a51ts_read(0x01, 0x00, name, sizeof(name)) || !a51ts_read(0x02, 0x04, fmt, sizeof(fmt))) {
++		printf("A51 TOUCH: no MSS100 at 0x48 (IICCON %#x IICSTAT %#x)\n",
++		    a5touch_read(a51ts_iic, IICCON), a5touch_read(a51ts_iic, IICSTAT));
++		return;
++	}
++	printf("A51 TOUCH: MSS100 \"%c%c%c\" event format %#x size %u type %u\n",
++	    name[0], name[1], name[2], fmt[0] | fmt[1] << 8, fmt[2], fmt[3] & 1u);
++	if (kernel_thread_start(a51ts_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A51 TOUCH: thread start failed\n");
++	}
++}
++#endif /* A51 */
++
+ void
+ a5xelte_touch_probe(void)
+ {
+ #if defined(DREAMLTE)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
++#endif
++#if defined(A51)
++	a51_touch_start();        /* the A5 path below stays off (A5_TOUCH_DEFAULT 0) */
+ #endif
+ 	int enabled = A5_TOUCH_DEFAULT; /* A5 touch: off on the S8 */
+ 	int log_contacts = 0;
