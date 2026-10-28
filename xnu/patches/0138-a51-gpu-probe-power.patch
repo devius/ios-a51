@@ -1,0 +1,352 @@
+A51 GPU: Mali-G72 probe and power (bsd/dev/a51_gpu.c).
+
+First part of the GPU service (docs/superpowers/specs/2026-10-29-a51-gpu-
+kernel-service-design.md), ported from the Galaxy S7's HeroGPU. A thread
+started from IOFindBSDRoot waits 5 s, then reads the GPU at 0x11500000 only
+if the PMU G3D domain (0x11860000 + 0x4064) reports on, logs its identity
+("A51 GPU: id ..."), and at a51gpu=2 soft-resets it and powers L2, all
+shader cores and the tiler ("A51 GPU: ready ..."). a51gpu=0 does nothing;
+a51gpu_pretend_off=1 exercises the domain-off path. No configuration
+quirks (Linux Panfrost writes none for the G72). a51_gpu_mmu.h (page-table
+and VA helpers, host-tested in tools/a51/gpu) is shipped for the next patch.
+
+diff --git i/bsd/conf/files w/bsd/conf/files
+index 851addd..246fee0 100644
+--- i/bsd/conf/files
++++ w/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
++bsd/dev/a51_gpu.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git i/bsd/dev/a51_gpu.c w/bsd/dev/a51_gpu.c
+new file mode 100644
+index 0000000..80fd580
+--- /dev/null
++++ w/bsd/dev/a51_gpu.c
+@@ -0,0 +1,202 @@
++/*
++ * A51 (Galaxy A51 SM-A515F, Exynos 9611) Mali-G72 MP3: the hardware layer of
++ * the GPU service, ported from the Galaxy S7's HeroGPU (herolte_gpu.c).
++ *
++ * Device tree: mali@11500000 (JOB/MMU/GPU interrupts), power domain pd-g3d
++ * with PMU status at 0x11860000 + 0x4064. S-Boot leaves the domain on and
++ * clocked (loader probe: status 0x3000f, GPU_ID 0x62210010 = G72 r0p1,
++ * 3 shader cores, not IO-coherent), so only Mali's own power sequence is
++ * needed. GPU registers are read only while the domain status low nibble is
++ * 0xf: an unpowered block can hang the bus. No configuration quirks: Linux
++ * Panfrost writes none for the G72.
++ *
++ * Boot-arg a51gpu: 0 nothing, 1 (default) probe, 2 also soft-reset and power
++ * L2, all shader cores and the tiler. a51gpu_pretend_off=1 treats the domain
++ * as off (tests the guard). Every poll is bounded; failures log and return.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(A51)
++#include "a51_gpu_mmu.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void a51_gpu_probe(void);
++
++#define A51_PMU_PA              0x11860000u
++#define A51_PMU_G3D_STAT        0x4064u
++#define A51_GPU_PA              0x11500000u
++#define A51_GPU_BYTES           0x5000u
++
++/* Mali register offsets (Linux Panfrost panfrost_regs.h). */
++#define GPU_ID                  0x000
++#define MMU_FEATURES            0x014
++#define AS_PRESENT              0x018
++#define JS_PRESENT              0x01c
++#define GPU_IRQ_RAWSTAT         0x020
++#define GPU_IRQ_CLEAR           0x024
++#define GPU_COMMAND             0x030
++#define GPU_STATUS              0x034
++#define SHADER_PRESENT_LO       0x100
++#define TILER_PRESENT_LO        0x110
++#define L2_PRESENT_LO           0x120
++#define SHADER_READY_LO         0x140
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++#define SHADER_PWRON_LO         0x180
++#define TILER_PWRON_LO          0x190
++#define L2_PWRON_LO             0x1a0
++#define COHERENCY_FEATURES      0x300
++#define GPU_CMD_SOFT_RESET      0x01
++#define GPU_IRQ_RESET_COMPLETED 0x100
++
++static vm_offset_t a51_pmu, a51_gpu_base;
++static int a51_gpu_mode = 1, a51_gpu_pretend_off;
++static int a51_gpu_sleep;
++
++static uint32_t
++a51_gpu_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(a51_gpu_base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a51_gpu_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(a51_gpu_base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint32_t
++a51_g3d_status(void)
++{
++	return *(volatile uint32_t *)(a51_pmu + A51_PMU_G3D_STAT);
++}
++
++static bool
++a51_gpu_powered(void)
++{
++	return !a51_gpu_pretend_off && (a51_g3d_status() & 0xf) == 0xf;
++}
++
++static void
++a51_gpu_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a51_gpu_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Write mask to a *_PWRON register, wait (20 ms at most) for *_READY. */
++static bool
++a51_gpu_power(uint32_t pwron, uint32_t ready, uint32_t mask, const char *name)
++{
++	a51_gpu_wr(pwron, mask);
++	uint32_t r = 0;
++	for (unsigned us = 0; us < 20000; us += 10) {
++		r = a51_gpu_rd(ready);
++		if ((r & mask) == mask) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("A51 GPU: power %s mask %#x: ready %#x, timed out\n", name, mask, r);
++	return false;
++}
++
++static bool
++a51_gpu_soft_reset(void)
++{
++	a51_gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++	a51_gpu_wr(GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	for (unsigned i = 0; i < 10000; i++) {
++		if (a51_gpu_rd(GPU_IRQ_RAWSTAT) & GPU_IRQ_RESET_COMPLETED) {
++			a51_gpu_wr(GPU_IRQ_CLEAR, 0xffffffffu);
++			return true;
++		}
++		delay(10);
++	}
++	printf("A51 GPU: soft reset timed out\n");
++	return false;
++}
++
++/* L2, then every shader core, then the tiler (Panfrost's order). */
++static bool
++a51_gpu_cores_on(void)
++{
++	return a51_gpu_power(L2_PWRON_LO, L2_READY_LO, a51_gpu_rd(L2_PRESENT_LO), "L2") &&
++	       a51_gpu_power(SHADER_PWRON_LO, SHADER_READY_LO, a51_gpu_rd(SHADER_PRESENT_LO), "shader") &&
++	       a51_gpu_power(TILER_PWRON_LO, TILER_READY_LO, a51_gpu_rd(TILER_PRESENT_LO), "tiler");
++}
++
++static void
++a51_gpu_report(void)
++{
++	printf("A51 GPU: id %#x shader %#x tiler %#x l2 %#x as %#x js %#x mmu %#x coh %#x\n",
++	    a51_gpu_rd(GPU_ID), a51_gpu_rd(SHADER_PRESENT_LO), a51_gpu_rd(TILER_PRESENT_LO),
++	    a51_gpu_rd(L2_PRESENT_LO), a51_gpu_rd(AS_PRESENT), a51_gpu_rd(JS_PRESENT),
++	    a51_gpu_rd(MMU_FEATURES), a51_gpu_rd(COHERENCY_FEATURES));
++	printf("A51 GPU: status %#x irq %#x\n", a51_gpu_rd(GPU_STATUS), a51_gpu_rd(GPU_IRQ_RAWSTAT));
++}
++
++static void
++a51_gpu_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	a51_gpu_msleep(5000);           /* after the early boot console traffic */
++	if (!a51_gpu_powered()) {
++		printf("A51 GPU: G3D off (%#x), not touched\n", a51_g3d_status());
++		return;
++	}
++	a51_gpu_base = ml_io_map(A51_GPU_PA, A51_GPU_BYTES);
++	if (!a51_gpu_base) {
++		printf("A51 GPU: MMIO mapping failed\n");
++		return;
++	}
++	a51_gpu_report();
++	if (a51_gpu_mode < 2) {
++		return;
++	}
++	if (!a51_gpu_soft_reset() || !a51_gpu_cores_on()) {
++		return;
++	}
++	printf("A51 GPU: ready shader %#x tiler %#x l2 %#x\n", a51_gpu_rd(SHADER_READY_LO),
++	    a51_gpu_rd(TILER_READY_LO), a51_gpu_rd(L2_READY_LO));
++}
++
++void
++a51_gpu_probe(void)
++{
++	thread_t thread;
++
++	PE_parse_boot_argn("a51gpu", &a51_gpu_mode, sizeof(a51_gpu_mode));
++	PE_parse_boot_argn("a51gpu_pretend_off", &a51_gpu_pretend_off, sizeof(a51_gpu_pretend_off));
++	if (a51_gpu_mode <= 0) {
++		return;
++	}
++	a51_pmu = ml_io_map(A51_PMU_PA, 0x8000);
++	if (!a51_pmu) {
++		printf("A51 GPU: PMU mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(a51_gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else /* !A51: the A5XELTE board config also builds the A5 and S8 */
++void a51_gpu_probe(void);
++void
++a51_gpu_probe(void)
++{
++}
++#endif /* A51 */
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git i/bsd/dev/a51_gpu_mmu.h w/bsd/dev/a51_gpu_mmu.h
+new file mode 100644
+index 0000000..e7a7ecd
+--- /dev/null
++++ w/bsd/dev/a51_gpu_mmu.h
+@@ -0,0 +1,93 @@
++/*
++ * A51 GPU (Mali-G72): pure page-table and GPU-VA helpers for bsd/dev/a51_gpu.c.
++ * No kernel headers, so tools/a51/gpu/test_mmu.c tests them on the host.
++ *
++ * Page tables are the legacy Mali-LPAE format with 4 KiB pages, as the S7's
++ * HeroGPU and Linux Panfrost (ARM_MALI_LPAE) use them: 3 levels of 512
++ * entries, L1 1 GiB, L2 2 MiB, L3 4 KiB. Encodings from herolte_gpu.c.
++ *
++ * User buffers get VAs in 64 KiB chunks from a bitmap, lowest free run
++ * first, so freed VAs are reused and the L3 tables stay few (S7 patch 0249:
++ * never reusing VAs exhausted its table pool after ~480 MB).
++ */
++#ifndef A51_GPU_MMU_H
++#define A51_GPU_MMU_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define A51_VA_CHUNK    0x10000ull
++#define A51_VA_CHUNKS   16384u          /* 1 GiB of user range */
++
++/* Level-3 entry for a 4 KiB page: read, write, inner shareable, access flag. */
++static inline uint64_t
++a51_pte_page(uint64_t pa)
++{
++	return (pa & ~0xfffull) | 0x2c1;
++}
++
++/* Level-1/2 entry pointing at the next table. */
++static inline uint64_t
++a51_pte_table(uint64_t pa)
++{
++	return pa | 3;
++}
++
++/* Index of va in the level 1..3 table. */
++static inline unsigned
++a51_pt_index(uint64_t va, unsigned level)
++{
++	return (unsigned)((va >> (12 + 9 * (3 - level))) & 0x1ff);
++}
++
++struct a51_va_pool {
++	uint64_t base, size;
++	uint64_t used[A51_VA_CHUNKS / 64];
++};
++
++static inline bool
++a51_va_chunk_used(const struct a51_va_pool *p, unsigned c)
++{
++	return (p->used[c / 64] >> (c % 64)) & 1;
++}
++
++/* Lowest free run of chunks covering bytes; 0 when none (nothing is taken). */
++static inline uint64_t
++a51_va_alloc(struct a51_va_pool *p, uint64_t bytes)
++{
++	unsigned chunks = (unsigned)(p->size / A51_VA_CHUNK);
++	uint64_t n = (bytes + A51_VA_CHUNK - 1) / A51_VA_CHUNK;
++	if (n == 0 || n > chunks) {
++		return 0;
++	}
++	unsigned run = 0;
++	for (unsigned c = 0; c < chunks; c++) {
++		if (a51_va_chunk_used(p, c)) {
++			run = 0;
++		} else if (++run == n) {
++			unsigned first = c + 1 - (unsigned)n;
++			for (unsigned k = first; k <= c; k++) {
++				p->used[k / 64] |= 1ull << (k % 64);
++			}
++			return p->base + first * A51_VA_CHUNK;
++		}
++	}
++	return 0;
++}
++
++/* Give back the chunks covering [va, va + bytes); outside the pool: ignored. */
++static inline void
++a51_va_free(struct a51_va_pool *p, uint64_t va, uint64_t bytes)
++{
++	if (va < p->base || va >= p->base + p->size || bytes == 0) {
++		return;
++	}
++	unsigned chunks = (unsigned)(p->size / A51_VA_CHUNK);
++	unsigned first = (unsigned)((va - p->base) / A51_VA_CHUNK);
++	uint64_t count = (bytes + A51_VA_CHUNK - 1) / A51_VA_CHUNK;
++	for (uint64_t k = first; k < first + count && k < chunks; k++) {
++		p->used[k / 64] &= ~(1ull << (k % 64));
++	}
++}
++
++#endif /* A51_GPU_MMU_H */
+diff --git i/iokit/bsddev/IOKitBSDInit.cpp w/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..4f927df 100644
+--- i/iokit/bsddev/IOKitBSDInit.cpp
++++ w/iokit/bsddev/IOKitBSDInit.cpp
+@@ -71,6 +71,7 @@ extern boolean_t cpuid_vmm_present(void);
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
++extern void a51_gpu_probe(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +775,8 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++	/* Mali-G72 probe and power (bsd/dev/a51_gpu.c; a no-op off the A51). */
++	a51_gpu_probe();
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
