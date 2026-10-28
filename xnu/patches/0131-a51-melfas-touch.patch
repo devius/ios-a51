@@ -13,13 +13,19 @@ interrupt line gpa0-0 (low while events are queued) like the S8 path, reads
 EVENT/PACKET_INFO then EVENT/PACKET_DATA, decodes EVENT_FORMAT_16BYTE records
 (A51 kernel melfas_mss100_mod.c) and feeds sweet_hid_touch() on
 SweetHIDTouch's 1080x1920 grid. The IIC sequence is Samsung's bootloader
-driver (lk3rd dev/i2c/exynos_i2c.c), polled.
+Boot 31 delivered touches to SweetHIDTouch but swipes did not register: the
+chip raised ~180 MIP_ALERT_MODE_STATE alerts per second and reported ghost
+contacts at the panel edge while charging from the USB cable. Set
+CTRL/CHARGER_MODE = 1 at start (mms_charger_attached(); boot-arg
+a51touchcharger=0 to skip), drop palm/hover/proximity contacts
+(TOUCHTYPE_PALM/HOVER/PROXIMITY), and rate-limit the alert log with the
+mode-state value.
 
 diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
-index ba647a8..359354d 100644
+index ba647a8..0d9561d 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
-@@ -920,11 +920,263 @@ dreamlte_touch_start(void)
+@@ -920,11 +920,295 @@ dreamlte_touch_start(void)
  }
  #endif /* DREAMLTE */
  
@@ -144,6 +150,21 @@ index ba647a8..359354d 100644
 +	return e == 0;
 +}
 +
++/* Write the two MIP4 register bytes followed by data. */
++static bool
++a51ts_write(const uint8_t *w, unsigned wlen)
++{
++	int e = a51iic_start(IICSTAT_MASTER_TX, A51TS_ADDR << 1, false);
++	for (unsigned i = 0; !e && i < wlen; i++) {
++		*(volatile uint8_t *)(a51ts_iic + IICDS) = w[i];
++		delay(1);
++		a51iic_resume();
++		e = a51iic_wait() ? -1 : ((a5touch_read(a51ts_iic, IICSTAT) & IICSTAT_LASTBIT) ? -2 : 0);
++	}
++	a51iic_stop(IICSTAT_MASTER_TX);
++	return e == 0;
++}
++
 +static void
 +a51ts_report(const uint8_t *p)
 +{
@@ -152,7 +173,13 @@ index ba647a8..359354d 100644
 +	}
 +	int id = (int)((p[0] >> 2) & 0x0fu) - 1;
 +	unsigned state = p[0] >> 6;             /* 1 press, 2 move, 3 release */
++	unsigned type = ((p[6] >> 4) & 0x0cu) | (p[7] >> 6);    /* TOUCHTYPE_* */
 +	if (id < 0 || id >= A51TS_FINGERS) {
++		return;
++	}
++	/* Palm (5), hover (1) and proximity (7) are not fingers; Samsung's driver
++	 * reports palms separately. Drop them unless already tracked down. */
++	if ((type == 5 || type == 1 || type == 7) && !a51ts_down[id] && state != 3) {
 +		return;
 +	}
 +	/* 12-bit panel coordinates onto SweetHIDTouch's 1080x1920 grid. */
@@ -160,7 +187,7 @@ index ba647a8..359354d 100644
 +	unsigned y = (((unsigned)p[2] << 4) | (p[3] & 0x0fu)) * 1920u / 4096u;
 +	if (state == 1 || state == 2) {
 +		if (!a51ts_down[id]) {
-+			printf("A51 TOUCH: down id=%d x=%u y=%u\n", id, x, y);
++			printf("A51 TOUCH: down id=%d x=%u y=%u type=%u\n", id, x, y, type);
 +		}
 +		a51ts_down[id] = true;
 +		a51ts_x[id] = (uint16_t)x;
@@ -216,7 +243,11 @@ index ba647a8..359354d 100644
 +		}
 +		errors = 0;
 +		if (info & 0x80u) {                    /* alert (mode state, ESD, ...) */
-+			printf("A51 TOUCH: alert %#x size %u\n", buf[0], size);
++			static unsigned alerts;
++			/* MIP_ALERT_MODE_STATE (9): noise/wet/VSYNC mode changes. */
++			if (++alerts <= 16 || !(alerts & 1023)) {
++				printf("A51 TOUCH: alert %#x data %#x (#%u)\n", buf[0], size > 1 ? buf[1] : 0, alerts);
++			}
 +			continue;
 +		}
 +		for (unsigned i = 0; i + A51TS_EVENT_SIZE <= size; i += A51TS_EVENT_SIZE) {
@@ -264,6 +295,13 @@ index ba647a8..359354d 100644
 +	}
 +	printf("A51 TOUCH: MSS100 \"%c%c%c\" event format %#x size %u type %u\n",
 +	    name[0], name[1], name[2], fmt[0] | fmt[1] << 8, fmt[2], fmt[3] & 1u);
++	/* CTRL / CHARGER_MODE = 1 (melfas_mss100.c mms_charger_attached()): the
++	 * phone is on a USB cable during bring-up. Without it boot 31 saw ~180
++	 * mode-state alerts per second and ghost contacts at the panel edge. */
++	int charger = 1;
++	(void)PE_parse_boot_argn("a51touchcharger", &charger, sizeof(charger));
++	const uint8_t chg[3] = { 0x06, 0x19, (uint8_t)(charger ? 1 : 0) };
++	printf("A51 TOUCH: charger mode %d %s\n", charger ? 1 : 0, a51ts_write(chg, 3) ? "set" : "write failed");
 +	if (kernel_thread_start(a51ts_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
