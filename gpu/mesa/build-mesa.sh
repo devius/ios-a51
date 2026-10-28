@@ -22,6 +22,10 @@ CC_IOS="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=$MIN_IOS -
 cd "$WORK"
 [ -d mesa ] || git clone -q --depth 1 --branch "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git mesa
 [ -d libdrm ] || git clone -q --depth 1 --branch "$LIBDRM_TAG" https://gitlab.freedesktop.org/mesa/drm.git libdrm
+# A kept tree (mac-mesa.sh reuses the work dir) was patched before: reset it,
+# or every asserted edit finds 0 matches.
+git -C mesa checkout -q -- .
+git -C mesa clean -qfd -e build
 python3 "$HERE/patch-mesa.py" mesa
 
 # The libdrm stand-in, and a pkg-config file pointing Mesa at it.

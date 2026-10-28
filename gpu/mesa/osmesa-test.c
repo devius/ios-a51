@@ -8,7 +8,8 @@
  * Run over SSH; the dylibs are in /private/var/root/gpu/lib (rpath). Output
  * goes to stdout and to the kernel log (herodrm_log). HERO_GPU=0 runs on
  * softpipe for comparison. Exit 0 only when the pixels are right and, unless
- * HERO_GPU=0, the renderer is Panfrost: a silent softpipe fallback fails (2).
+ * HERO_GPU=0, the renderer is Panfrost: a silent softpipe fallback fails (2),
+ * any failed GPU job in the run fails (3), wrong pixels fail (1).
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -21,6 +22,7 @@
 #include <GL/osmesa.h>
 
 void herodrm_log(const char *fmt, ...);
+unsigned long long herodrm_fault_count(void);
 
 #include <stdarg.h>
 
@@ -160,6 +162,10 @@ main(int argc, char **argv)
    say("%d frames %dx%d with glFinish: %.1f ms, %.2f ms/frame (%.0f fps) on %s",
        n, W, H, ms, ms / n, n * 1000.0 / ms, on_gpu ? "the GPU" : "softpipe");
    rc = pixels_ok ? 0 : 1;
+   if (herodrm_fault_count()) {    /* a failed GPU job anywhere in the run */
+      say("FAIL: %llu GPU job(s) failed (kernel log has the status)", herodrm_fault_count());
+      rc = 3;
+   }
 
    OSMesaDestroyContext(ctx);
 out:

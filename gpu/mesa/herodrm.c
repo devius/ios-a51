@@ -379,8 +379,17 @@ submit(struct drm_panfrost_submit *s)
       DBG("SUBMIT #%llu jc 0x%llx js %llu: %llu us", (unsigned long long)submits,
           (unsigned long long)s->jc, (unsigned long long)in[1], (unsigned long long)out[1]);
    }
-   /* A faulting job is reported, not fatal: Mesa would abort on an error. */
-   return kr ? fail(EIO) : 0;
+   /* A failed job (kr, or a JS_STATUS / ~0 for the kernel's 200 ms hard-stop
+    * in out[0]) is EIO: Mesa 25.0.7 logs it and continues (pan_jm.c,
+    * pan_job.c); herodrm_fault_count() lets a test fail on it. */
+   return (kr || out[0]) ? fail(EIO) : 0;
+}
+
+/* Failed submits so far (osmesa-test exits 3 when this is not 0). */
+EXPORT unsigned long long
+herodrm_fault_count(void)
+{
+   return (unsigned long long)faults;
 }
 
 EXPORT int
