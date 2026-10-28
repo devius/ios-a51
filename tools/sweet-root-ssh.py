@@ -50,6 +50,28 @@ JOB = '/System/Library/LaunchDaemons/com.sweet.sshd.plist'
 OLD_JOB = '/System/Library/LaunchDaemons/com.sweet.dropbear.plist'
 LOG_JOB = '/System/Library/LaunchDaemons/com.sweet.sshlog.plist'
 DIAG_JOB = '/System/Library/LaunchDaemons/com.sweet.sshdiag.plist'
+WRAPPER = '/var/jb/usr/libexec/sweet-sshd'
+WRAPPER_SCRIPT = r"""#!/var/jb/usr/bin/bash
+# com.sweet.sshd: make Procursus' user database, then run sshd (tools/sweet-root-ssh.py)
+# Procursus binaries (sshd, id, bash, ...) never call Apple's getpwnam: Procursus
+# prepends #include <libiosexec.h> to the SDK's pwd.h/grp.h, so getpwnam is
+# ie_getpwnam (libiosexec 1.3.1, LIBIOSEXEC_PREFIXED_ROOT=1), which reads only
+# the Berkeley DB files /var/jb/etc/spwd.db (euid 0) / pwd.db, and getgrnam
+# reads /var/jb/etc/group. pwd_mkdb (system-cmds, same libc dbopen) makes them
+# from /var/jb/etc/master.passwd; it needs group "wheel" in /var/jb/etc/group
+# and renames its input file to master.passwd, so it gets a copy.
+export PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+etc=/var/jb/etc
+{
+	rm -f $etc/pwd.db.tmp $etc/spwd.db.tmp $etc/master.passwd.new $etc/master.passwd.new.orig
+	cp $etc/master.passwd $etc/master.passwd.new &&
+		/var/jb/usr/sbin/pwd_mkdb -p -d $etc $etc/master.passwd.new
+	echo "pwd_mkdb exit $?"
+	ls -ln $etc
+	id; id root; id sshd
+} >/var/jb/var/log/pwd_mkdb.log 2>&1
+exec /var/jb/usr/sbin/sshd -D -o UsePAM=no -o StrictModes=no -o LogLevel=VERBOSE -E /var/jb/var/log/sshd.log
+"""
 DIAG = '/var/jb/usr/libexec/sweet-sshdiag'
 DIAG_SCRIPT = r'''#!/var/jb/usr/bin/bash
 # com.sweet.sshdiag: SSH diagnostics to the PC's live log (tools/sweet-root-ssh.py)
@@ -62,16 +84,25 @@ tag() { while IFS= read -r l; do echo "SSHDIAG $1 $l"; done; }
 	/private/var/root/.ssh /private/var/root/.ssh/authorized_keys /var/jb/bin/bash \
 	/var/jb/var/empty /var/jb/var/log; ls -ln /var/jb/var/log; cat /etc/shells; } 2>&1 | tag sys
 grep -E '^(root|sshd|_sshd):' /etc/master.passwd /etc/passwd 2>&1 | tag pw
-# user lookups (getpwnam) fail on this port: try each Libinfo path
-for u in root 0 mobile 501 _sshd sshd; do
-	echo "id $u: $(id $u 2>&1) | XBS_DISABLE_LIBINFO: $(XBS_DISABLE_LIBINFO=YES id $u 2>&1)"
-done 2>&1 | tag id
+# Procursus getpwnam = libiosexec: /var/jb/etc/{spwd.db,pwd.db,group}, made by pwd_mkdb in sweet-sshd
+cat /var/jb/var/log/pwd_mkdb.log 2>&1 | tag mkdb
+ls -ln /var/jb/etc 2>&1 | tag db
+grep -E '^(root|sshd|_sshd):' /var/jb/etc/master.passwd /var/jb/etc/passwd 2>&1 | tag jbpw
+grep -E '^wheel:' /var/jb/etc/group 2>&1 | tag jbpw
+cat /var/jb/etc/does-not-exist 2>&1 | tag errno	# ENOENT expected; "Invalid argument" = kernel bug
+for u in root 0 sshd 75 mobile; do echo "id $u: $(id $u 2>&1)"; done 2>&1 | tag id
+echo "~root=$(bash -c 'echo ~root')" 2>&1 | tag id
+# redo pwd_mkdb here so its own output reaches the PC even if the sshd wrapper failed
+rm -f /var/jb/etc/pwd.db.tmp /var/jb/etc/spwd.db.tmp /var/jb/etc/master.passwd.new /var/jb/etc/master.passwd.new.orig
+cp /var/jb/etc/master.passwd /var/jb/etc/master.passwd.new && pwd_mkdb -p -d /var/jb/etc /var/jb/etc/master.passwd.new 2>&1 | tag mkdb2
+echo "pwd_mkdb exit ${PIPESTATUS[0]}; $(id root 2>&1)" | tag mkdb2
+ls -ln /var/jb/etc/pwd.db /var/jb/etc/spwd.db 2>&1 | tag mkdb2
 ls -ld /etc 2>&1 | tag id
-sshd -T -o UsePAM=no -o StrictModes=no 2>&1 | grep -iE 'permitroot|pubkey|password|authorizedkeys|strict|usepam|usedns|allowusers|denyusers' | tag cfg
+sshd -T -o UsePAM=no -o StrictModes=no 2>&1 | grep -iE 'permitroot|pubkey|password|authorizedkeys|strict|usepam|usedns|allowusers|denyusers|privilegesep' | tag cfg
 cat /var/jb/var/log/sshd.log /var/jb/var/log/sshd.out 2>&1 | tail -n 30 | tag log
 while true; do
 	# re-exec needs the absolute path
-	XBS_DISABLE_LIBINFO=YES /var/jb/usr/sbin/sshd -d -D -p 2222 -o UsePAM=no -o StrictModes=no -o LogLevel=DEBUG2 2>&1 | tag dbg
+	/var/jb/usr/sbin/sshd -d -D -p 2222 -o UsePAM=no -o StrictModes=no -o LogLevel=DEBUG2 2>&1 | tag dbg
 	sleep 2
 done
 '''
@@ -99,11 +130,12 @@ def install_tree(root, tree, hostkeys):
             os.chmod(os.path.join(ssh, n), 0o600)
     os.chmod(os.path.join(dst, 'var/empty'), 0o755)
     os.makedirs(os.path.join(dst, 'var/log'), exist_ok=True)
-    diag = os.path.join(root, DIAG.lstrip('/').replace('var/jb', 'private/var/jb', 1))
-    with open(diag, 'w') as f:
-        f.write(DIAG_SCRIPT)
-    os.chown(diag, 0, 0)
-    os.chmod(diag, 0o755)
+    for path, text in ((DIAG, DIAG_SCRIPT), (WRAPPER, WRAPPER_SCRIPT)):
+        path = os.path.join(root, path.lstrip('/').replace('var/jb', 'private/var/jb', 1))
+        with open(path, 'w') as f:
+            f.write(text)
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o755)
     print('installed', dst)
 
 
@@ -116,11 +148,9 @@ def launchd(root):
     jobs.pop(OLD_JOB, None)
     jobs[JOB] = {
         'Label': 'com.sweet.sshd',
-        'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-o', 'UsePAM=no', '-o', 'StrictModes=no',
-                             '-o', 'LogLevel=VERBOSE', '-E', '/var/jb/var/log/sshd.log'],
-        # Libinfo: skip the usermanagerd (muser) source and read /etc/master.passwd
-        'EnvironmentVariables': {'PATH': '/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin',
-                                 'XBS_DISABLE_LIBINFO': 'YES'},
+        # pwd_mkdb for libiosexec's user database, then sshd (see WRAPPER_SCRIPT)
+        'ProgramArguments': ['/var/jb/usr/bin/bash', WRAPPER],
+        'EnvironmentVariables': {'PATH': '/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin'},
         'StandardOutPath': '/var/jb/var/log/sshd.out',
         'StandardErrorPath': '/var/jb/var/log/sshd.out',
         'UserName': 'root',
@@ -173,7 +203,16 @@ def accounts(root):
     if SHELL not in have:
         with open(shells, 'a') as f:
             f.write(SHELL + '\n')
-    print('root shell', SHELL, '+ privsep user sshd')
+    # Procursus' libiosexec resolves users from /var/jb/etc, never from /etc:
+    # same files there; sweet-sshd turns master.passwd into pwd.db/spwd.db
+    jbetc = os.path.join(root, 'private/var/jb/etc')
+    os.makedirs(jbetc, exist_ok=True)
+    for name, mode in (('master.passwd', 0o600), ('passwd', 0o644), ('group', 0o644), ('shells', 0o644)):
+        dst = os.path.join(jbetc, name)
+        shutil.copyfile(os.path.join(root, 'private/etc', name), dst)
+        os.chown(dst, 0, 0)
+        os.chmod(dst, mode)
+    print('root shell', SHELL, '+ privsep user sshd; copies in /var/jb/etc for libiosexec')
 
 
 def authorized_key(root, key):
