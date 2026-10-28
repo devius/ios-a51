@@ -1,0 +1,120 @@
+A51: an "AMFI" policy answers dyld for backboardd (GPU UI).
+
+dyld honours DYLD_* only when __mac_syscall("AMFI", 90) allows it; the port
+has no policy of that name (ours is "A5XELTE AMFI"), so backboardd's
+DYLD_INSERT_LIBRARIES (the EAGL shim, set in launchd.plist) would be dropped
+silently. Register "AMFI" with only that syscall: backboardd's first 2
+launches per boot get ALLOW_AT_PATH|ALLOW_PATH_VARS|ALLOW_FAILED_LIBRARY_
+INSERTION (S7 0246), later launches and every other process get ENOPOLICY
+as before (crash-loop guard: the CPU renderer comes back). a51gl=0: off.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 4fd8729..f0e57f7 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -34,6 +34,9 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/errno.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -385,6 +388,84 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(A51)
++/*
++ * Policy "AMFI" (A51, GPU sub-project 3): dyld's amfi_check_dyld_policy_self()
++ * is __mac_syscall("AMFI", 90, &{ u64 input flags, u64 *output flags }). With
++ * no policy of that name the call fails with ENOPOLICY and dyld ignores every
++ * DYLD_* variable, so backboardd's DYLD_INSERT_LIBRARIES (the EAGL shim,
++ * gpu/eagl, set in launchd.plist) would be dropped silently. Only backboardd
++ * gets an answer, and only for its first 2 launches per boot (a crash-looping
++ * shim then gives way to the CPU renderer, as the S7's 0245 guard did); boot-arg
++ * a51gl=0 turns it off. Every other call keeps failing with ENOPOLICY, exactly
++ * as with no policy. From the S7 port's 0246.
++ */
++#define A51_GL_MAX_LAUNCHES                             2
++#define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ull << 0)
++#define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ull << 1)
++#define AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION (1ull << 5)
++
++static int a51_gl_mode = -1;            /* boot-arg a51gl, default 1 */
++static int a51_gl_launches;
++static int a51_gl_pid = -1;
++
++static uint64_t
++a51_gl_dyld_flags(struct proc *p)
++{
++	if (a51_gl_mode < 0) {
++		a51_gl_mode = 1;
++		PE_parse_boot_argn("a51gl", &a51_gl_mode, sizeof(a51_gl_mode));
++	}
++	char name[32];
++	int pid = proc_pid(p);
++	proc_name(pid, name, sizeof(name));
++	if (!a51_gl_mode || strcmp(name, "backboardd") != 0) {
++		return 0;
++	}
++	if (pid != a51_gl_pid) {
++		a51_gl_pid = pid;
++		a51_gl_launches++;
++		printf("A51 GL: backboardd launch %d (pid %d): DYLD_* %s\n", a51_gl_launches, pid,
++		    a51_gl_launches <= A51_GL_MAX_LAUNCHES ? "allowed" : "ignored (crash-loop guard)");
++	}
++	if (a51_gl_launches > A51_GL_MAX_LAUNCHES) {
++		return 0;
++	}
++	return AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
++	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
++}
++
++static int
++a51_amfi_dyld_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		uint64_t output;        /* user pointer to a u64 */
++	} args;
++	uint64_t flags;
++
++	if (call != 90 || (flags = a51_gl_dyld_flags(p)) == 0) {
++		return ENOPOLICY;
++	}
++	if (copyin(arg, &args, sizeof(args)) != 0) {
++		return EFAULT;
++	}
++	return copyout(&flags, (user_addr_t)args.output, sizeof(flags));
++}
++
++static const struct mac_policy_ops a51_amfi_dyld_mac_ops = {
++	.mpo_policy_syscall = a51_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf a51_amfi_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "A51 dyld policy for the GPU UI (backboardd)",
++	.mpc_ops = &a51_amfi_dyld_mac_ops,
++};
++
++static mac_policy_handle_t a51_amfi_dyld_mac_handle;
++#endif /* A5XELTE && A51 */
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -397,5 +478,10 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf(PORT_NAME " Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(A51)
++	error = mac_policy_register(&a51_amfi_dyld_mac_conf, &a51_amfi_dyld_mac_handle, NULL);
++	printf("A51 GL: dyld policy \"AMFI\" %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
++#endif
+ }
+ #endif /* SWEET || A5XELTE */

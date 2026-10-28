@@ -1,0 +1,31 @@
+SweetSurface: refuse IOSurface wrap selectors 6/7 (S7 0244).
+
+IOSurfaceRootUserClient selectors 6 (wrap client image) and 7 (wrap client
+memory) answer with a lock result the library turns into an IOSurfaceClient.
+The default case's zeroed success left a client with NULL pointers; on the
+S7, once backboardd drew through the GPU, IOSurfaceGetBulkAttachments then
+faulted on NULL+0x30. Refuse them: CoreAnimation takes its copying path.
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..8f1182a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -772,6 +772,18 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:         /* wrap client image: struct in 0x20 */
++	case 7:         /* wrap client memory: scalars [address, length] */
++		/*
++		 * Both answer with a lock result that the library turns into an
++		 * IOSurfaceClient. Not implemented: refuse, so the library returns
++		 * NULL and the caller (CoreAnimation's image upload) takes its
++		 * copying path. The default case's zeroed "success" left a client
++		 * with NULL pointers; on the S7 IOSurfaceGetBulkAttachments then
++		 * faulted on NULL+0x30 once backboardd drew through the GPU (S7 0244).
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
