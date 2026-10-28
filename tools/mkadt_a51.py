@@ -99,6 +99,13 @@ def build(canvas=(FB_W, FB_H), fb_phys=FB_PHYS):
     set_prop(root, 'compatible', mkadt.cstr('samsung,a51') +
              mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,exynos9610') +
              mkadt.cstr('AppleARM'))
+    # Device identity. Without a serial number and the wlan/bluetooth MACs
+    # (udid-version 1), MobileGestalt cannot answer UniqueDeviceID, lsd blocks
+    # in MGCopyAnswer and iOS never leaves the Apple logo. Synthetic values.
+    set_prop(root, 'serial-number', mkadt.cstr('F17A51XNU001'))
+    set_prop(root, 'mlb-serial-number', mkadt.cstr('F17A51XNU001MLB1'))
+    set_prop(root, 'model-number', mkadt.cstr('MQAX2'))
+    set_prop(root, 'region-info', mkadt.cstr('LL/A'))
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
@@ -134,6 +141,12 @@ def build(canvas=(FB_W, FB_H), fb_phys=FB_PHYS):
         ('canvas-width', mkadt.u32(canvas[0])),
         ('canvas-height', mkadt.u32(canvas[1])),
     ]))
+    # locally administered MACs, see the identity note above
+    for name, last in (('wlan', 1), ('bluetooth', 2)):
+        arm_io.children.append(mkadt.node(name, [
+            ('device_type', mkadt.cstr(name)),
+            ('local-mac-address', bytes([0x02, 0xa5, 0x51, 0, 0, last])),
+        ]))
 
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
