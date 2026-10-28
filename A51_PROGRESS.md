@@ -917,3 +917,23 @@ Spec/plan: `docs/superpowers/specs/2026-10-29-a51-gpu-kernel-service-design.md`,
 
 0144 (final review: `JS_FLUSH_ID_NEXT` with flush reduction, no stale job
 status) is built (kernel144) but not booted yet.
+
+## GPU sub-project 2: Mesa Panfrost in iOS (2026-10-29) — done
+
+Spec/plan: `docs/superpowers/specs/2026-10-29-a51-gpu-mesa-design.md`,
+`docs/superpowers/plans/2026-10-29-a51-gpu-mesa.md`. `gpu/mesa/` (the S7
+port's layer: Mesa 25.0.7 OSMesa + Gallium Panfrost, libdrm stand-in over
+HeroGPU), built on the Mac VM (`tools/a51/host/mac-mesa.sh`, 2 min), copied
+over SSH to `/private/var/root/gpu`. Boot 42 (kernel143, `a51gpu=3 a51gpulog=1`).
+
+| Run | GL_RENDERER | Pixels | 256x256 with glFinish |
+|---|---|---|---|
+| `HERO_GPU=0 ./osmesa-test 100` | softpipe | ok (8192 red, 57344 blue) | 5.03 ms/frame, 199 fps |
+| `./osmesa-test 300` | **Mali-G72 (Panfrost)**, GL 2.1 | ok, identical | 4.56 ms/frame, 219 fps |
+
+Kernel log for the GPU run: 1204 jobs (602 vertex/tiler on JS1, 602 fragment
+on JS0), all status 0, 28-871 us each (median 95 us): the 200 ms job limit is
+far away. At this size the time is per-frame overhead (synchronous submit,
+glFinish, two console lines per frame with a51gpulog=1), not GPU work.
+Note: loader-15min's dead-man timer also resets a *healthy* boot into TWRP
+after 15 minutes.
