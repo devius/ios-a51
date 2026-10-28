@@ -1,0 +1,47 @@
+A51 GPU: flush id with flush reduction; no stale job status (final review).
+
+Patch 0139 set JS_CONFIG's ENABLE_FLUSH_REDUCTION (bit 14) without
+writing JS_FLUSH_ID_NEXT, which Panfrost sets from GPU_LATEST_FLUSH_ID for
+every job: after a faulted job (no end flush) the next start flush could be
+skipped and a rewritten descriptor read stale from L2. a51_gpu_run() also
+returned on an MMU UPDATE timeout with the previous job's JS_STATUS still
+in a51_last_js_status, which herolte_gpu_submit() then reported.
+
+diff --git i/bsd/dev/a51_gpu.c w/bsd/dev/a51_gpu.c
+index 4257607..580d9ed 100644
+--- i/bsd/dev/a51_gpu.c
++++ w/bsd/dev/a51_gpu.c
+@@ -78,6 +78,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ #define COHERENCY_FEATURES      0x300
+ #define GPU_CMD_SOFT_RESET      0x01
+ #define GPU_IRQ_RESET_COMPLETED 0x100
++#define GPU_LATEST_FLUSH_ID     0x038
+ #define GPU_FAULTSTATUS         0x03c
+ #define GPU_FAULTADDR_LO        0x040
+ #define JOB_IRQ_RAWSTAT         0x1000
+@@ -92,6 +93,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ #define JS_AFFINITY_NEXT_LO     0x50
+ #define JS_AFFINITY_NEXT_HI     0x54
+ #define JS_CONFIG_NEXT          0x58
++#define JS_FLUSH_ID_NEXT        0x70
+ #define JS_COMMAND_NEXT         0x60
+ #define JS_STATUS_ACTIVE        0x08
+ #define JS_COMMAND_START        1
+@@ -338,6 +340,7 @@ a51_gpu_run(unsigned js, uint64_t jc, const char *what)
+ {
+ 	uint32_t slot = JS_BASE(js);
+ 	uint64_t start = mach_absolute_time(), ns;
++	a51_last_js_status = ~0u;       /* until this job ran: no stale status */
+ 	a51_gpu_wr(MMU_IRQ_CLEAR, 0xffffffffu);
+ 	a51_gpu_wr(JOB_IRQ_CLEAR, 0xffffffffu);
+ 	if (!a51_as_ok) {
+@@ -360,6 +363,9 @@ a51_gpu_run(unsigned js, uint64_t jc, const char *what)
+ 	a51_gpu_wr(slot + JS_AFFINITY_NEXT_LO, a51_gpu_rd(SHADER_PRESENT_LO));
+ 	a51_gpu_wr(slot + JS_AFFINITY_NEXT_HI, 0);
+ 	a51_gpu_wr(slot + JS_CONFIG_NEXT, A51_JS_CONFIG);
++	/* With flush reduction the job manager skips a flush whose id is not
++	 * newer than the slot's; give it the latest id (Panfrost does). */
++	a51_gpu_wr(slot + JS_FLUSH_ID_NEXT, a51_gpu_rd(GPU_LATEST_FLUSH_ID));
+ 	a51_gpu_wr(slot + JS_COMMAND_NEXT, JS_COMMAND_START);
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
