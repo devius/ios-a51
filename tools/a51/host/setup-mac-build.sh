@@ -51,6 +51,25 @@ have bash || {
 	tar -xzf "$tmp/bash.tgz" -C "$tmp"
 	(cd "$tmp/bash-5.2.37" && ./configure --prefix=/usr/local --quiet >/dev/null && make -s -j"$(sysctl -n hw.ncpu)" >/dev/null && sudo make -s install >/dev/null)
 }
+# Mesa (gpu/mesa/build-mesa.sh): GNU bison 3 (macOS has 2.3), pkg-config, and
+# a Python venv with meson and Mesa's generators (mako, pyyaml, packaging).
+have bison || {
+	fetch https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.gz "$tmp/bison.tgz"
+	tar -xzf "$tmp/bison.tgz" -C "$tmp"
+	(cd "$tmp/bison-3.8.2" && ./configure --prefix=/usr/local --quiet >/dev/null && make -s -j"$(sysctl -n hw.ncpu)" >/dev/null && sudo make -s install >/dev/null)
+}
+have pkg-config || {
+	fetch https://distfiles.ariadne.space/pkgconf/pkgconf-2.3.0.tar.xz "$tmp/pkgconf.txz"
+	tar -xJf "$tmp/pkgconf.txz" -C "$tmp"
+	(cd "$tmp/pkgconf-2.3.0" && ./configure --prefix=/usr/local --quiet >/dev/null && make -s -j"$(sysctl -n hw.ncpu)" >/dev/null && sudo make -s install >/dev/null)
+	sudo ln -sf /usr/local/bin/pkgconf "$bin/pkg-config"
+}
+venv=$HOME/mesa-venv
+[[ -x $venv/bin/meson ]] && echo "  mesa venv: already there" || {
+	/usr/bin/python3 -m venv "$venv"
+	"$venv/bin/pip" install -q --upgrade pip
+	"$venv/bin/pip" install -q meson mako pyyaml packaging setuptools
+}
 
 say "2/4 Xcode 15.2"
 xcode=$(ls -d /Applications/Xcode*15.2*.app 2>/dev/null | head -1 || true)

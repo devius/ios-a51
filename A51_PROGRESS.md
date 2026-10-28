@@ -901,3 +901,19 @@ Touch recovery gesture (0133): holding the top-left corner (x, y < 100) for
 - locationd, WirelessRadioManagerd, PosterBoard crash (no baseband, Wi-Fi,
   GPU); usermanagerd fails its multi-user setup ("FAILED to Set Foreground ID").
 - One core (MPIDR 0x103) is kept for the dead-man timer (`cpus=7`).
+
+## GPU sub-project 1: kernel GPU service (2026-10-29) — done
+
+Spec/plan: `docs/superpowers/specs/2026-10-29-a51-gpu-kernel-service-design.md`,
+`docs/superpowers/plans/2026-10-29-a51-gpu-kernel-service.md`. Patches
+0138–0144 (branch `a51-gpu`), kernels built in the Mac VM
+(`tools/a51/host/mac-kernel.sh`).
+
+| Boot | Kernel | Result |
+|---|---|---|
+| 40 | 0138–0140 | `A51 GPU: id 0x62210010 shader 0x7 tiler 0x1 l2 0x1 as 0xff js 0x7 mmu 0x2830 coh 0`, then panic `kmem_alloc(..., 8388608)`: one 8 MiB `ml_io_map` (fixed by 0141); the panic hung until the dead-man timer |
+| 41 | + 0141 | power, AS0 and jobs work: bad job faults at its unmapped VA and is recovered by soft reset; `WRITE_VALUE` in 142 us. `herogpu-test` hung after GetParam |
+| 42 | + 0142, 0143 | 0142 (S7 0242: 32-bit page shift in `pmap_sync_page_attributes_phys`, RAM above 4 GiB) fixes it: `herogpu-test` CreateBO/MapBO/Submit `write_value ok`, 429 us, exit 0. 0143: a panic warm-resets into TWRP |
+
+0144 (final review: `JS_FLUSH_ID_NEXT` with flush reduction, no stale job
+status) is built (kernel144) but not booted yet.
