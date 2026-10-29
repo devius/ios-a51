@@ -43,5 +43,6 @@ EOP
   -Dopengl=true -Dgles2=enabled -Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled \
   -Dvideo-codecs= -Dtools= -Dlmsensors=disabled -Dbuild-tests=false -Dzstd=disabled -Dxmlconfig=disabled \
   -Dexpat=disabled -Dgallium-xa=disabled -Dosmesa=false -Dperfetto=false > setup.log
-ninja -j"${JOBS:-4}" -C build src/gallium/drivers/panfrost/air_bifrost
+ninja -j"${JOBS:-4}" -C build src/gallium/drivers/panfrost/air_bifrost src/compiler/air/air2nir
 echo "air_bifrost: $WORK/build/src/gallium/drivers/panfrost/air_bifrost"
+echo "air2nir:     $WORK/build/src/compiler/air/air2nir"

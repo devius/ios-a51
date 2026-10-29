@@ -15,6 +15,8 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 
 ## Changed files
 
+- tools/corpus.py
+
 ## Added files
 
 - check-vendor.sh
@@ -23,3 +25,5 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - test/host/test_air_bifrost.sh
 - test/host/fixtures/quad.metal
 - test/host/fixtures/quad.metallib
+- tools/test_corpus.py
+- results/ios16.7-bifrost.md

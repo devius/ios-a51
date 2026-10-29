@@ -13,6 +13,8 @@ Each function is counted under the first stage it fails; the failure text is nor
 Nothing here says a translated shader is *correct*: that needs the GPU (spike 2).
 
 usage: corpus.py --air2nir BIN --ir3 BIN [--chip 0x06030001] [--json OUT] [--md OUT] [-j N] LIB...
+       corpus.py --backend bifrost --air2nir BIN --compiler AIR_BIFROST [--gpu-id 0x6221] ... LIB...
+(A51: stage 4 through Panfrost's Bifrost compiler, gpu/metal/host/air_bifrost.c.)
 """
 import argparse, collections, json, os, re, struct, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -70,10 +72,28 @@ def run_ir3(ir3, chip, mtlb_path, fn):
     return 'ok', '', out
 
 
+def run_bifrost(compiler, gpu_id, mtlb_path, fn):
+    """A51: air_bifrost [--gpu-id ID] LIB FN; a crash counts as this function's failure."""
+    try:
+        p = subprocess.run([compiler, '--gpu-id', gpu_id, mtlb_path, fn], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return 'timeout', 'bifrost timeout (120 s)', None
+    out = p.stdout + p.stderr
+    if p.returncode != 0:
+        lines = [l for l in out.splitlines() if l.strip()]
+        sig = 'signal %d: ' % -p.returncode if p.returncode < 0 else ''
+        pick = [l for l in lines if re.search(r'ssert|rror|fail|unsupported|not supported|NIR_PASS|abort', l)]
+        return 'fail', sig + (pick[-1] if pick else (lines[-1] if lines else 'exit %d' % p.returncode)), None
+    return 'ok', '', out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--air2nir', required=True)
-    ap.add_argument('--ir3', required=True)
+    ap.add_argument('--backend', choices=('ir3', 'bifrost'), default='ir3')
+    ap.add_argument('--ir3')
+    ap.add_argument('--compiler', help='air_bifrost, for --backend bifrost')
+    ap.add_argument('--gpu-id', default='0x6221')
     ap.add_argument('--chip', default='0x06030001')
     ap.add_argument('--json')
     ap.add_argument('--md')
@@ -81,6 +101,11 @@ def main():
     ap.add_argument('-j', type=int, default=2)
     ap.add_argument('libs', nargs='+')
     a = ap.parse_args()
+    if a.backend == 'ir3' and not a.ir3:
+        ap.error('--ir3 is required for --backend ir3')
+    if a.backend == 'bifrost' and not a.compiler:
+        ap.error('--compiler is required for --backend bifrost')
+    be = a.backend
     work = a.work or tempfile.mkdtemp(prefix='corpus-')
     os.makedirs(work, exist_ok=True)
 
@@ -117,6 +142,13 @@ def main():
                                 'why': (rep.stderr.strip().splitlines() or ['no module'])[-1], 'kind': '-'})
 
     def job(r):
+        if be == 'bifrost':
+            st, why, out = run_bifrost(a.compiler, a.gpu_id, r['mtlb'], r['fn'])
+            r['ir3'], r['ir3_why'] = st, why
+            m = out and re.search(r'bytes=(\d+)', out)
+            if m:
+                r['bytes'] = int(m.group(1))
+            return
         st, why, out = run_ir3(a.ir3, a.chip, r['mtlb'], r['fn'])
         r['ir3'] = st
         r['ir3_why'] = why
@@ -140,7 +172,7 @@ def main():
         if r['status'] != 'ok':
             key = ('%s: %s' % (r['stage'], norm(r['why'])))
         elif r.get('ir3') != 'ok':
-            key = 'ir3: ' + norm(r.get('ir3_why', ''))
+            key = be + ': ' + norm(r.get('ir3_why', ''))
         else:
             continue
         classes[key] += 1
@@ -156,9 +188,10 @@ def main():
     summary['by_lib_kind'] = [{'lib': l, 'kind': k, 'total': v[0], 'translate_ok': v[1], 'ir3_ok': v[2]} for (l, k), v in sorted(by_kind.items())]
     if a.json:
         json.dump({'summary': summary, 'results': results}, open(a.json, 'w'), indent=1)
-    lines = ['functions=%d reader_ok=%d translate_ok=%d ir3_ok=%d (chip %s)' % (total, n_read, n_tr, n_ir3, a.chip)]
+    target = 'gpu id %s' % a.gpu_id if be == 'bifrost' else 'chip %s' % a.chip
+    lines = ['functions=%d reader_ok=%d translate_ok=%d %s_ok=%d (%s)' % (total, n_read, n_tr, be, n_ir3, target)]
     for e in summary['by_lib_kind']:
-        lines.append('  %-44s %-10s total=%-4d translate=%-4d ir3=%d' % (e['lib'], e['kind'], e['total'], e['translate_ok'], e['ir3_ok']))
+        lines.append('  %-44s %-10s total=%-4d translate=%-4d %s=%d' % (e['lib'], e['kind'], e['total'], e['translate_ok'], be, e['ir3_ok']))
     for c in summary['classes']:
         lines.append('  [%d] %s   e.g. %s' % (c['count'], c['class'], ', '.join(c['examples'][:2])))
     txt = '\n'.join(lines)

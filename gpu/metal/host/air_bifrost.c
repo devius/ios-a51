@@ -126,6 +126,16 @@ main(int argc, char **argv)
    if (!nir)
       errx(1, "%s: %s", entry ? entry : path, error);
 
+   /* A kernel with no fixed threadgroup size is compiled per dispatch, with the size it
+    * is dispatched with (air_metal.c's compute_state_for); 32x1x1 stands for one here.
+    */
+   if (gl_shader_stage_is_compute(nir->info.stage) && nir->info.workgroup_size_variable) {
+      nir->info.workgroup_size[0] = 32;
+      nir->info.workgroup_size[1] = 1;
+      nir->info.workgroup_size[2] = 1;
+      nir->info.workgroup_size_variable = false;
+   }
+
    /* finalize_for_gallium (air_metal.c), for a screen with fs_position_is_sysval */
    NIR_PASS(_, nir, nir_lower_system_values);
    static const nir_lower_compute_system_values_options cs_options = { 0 };
