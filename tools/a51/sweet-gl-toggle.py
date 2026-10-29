@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn the GPU UI (EAGL shim in backboardd) on or off on the A51, over SSH.
 
-  sweet-gl-toggle.py on|off|status [--blit] [--direct]
+  sweet-gl-toggle.py on|off|status [--blit] [--direct] [--debug] [--no-restart]
 
 Sets the switch file /private/var/a51gpu/gl-on (kernel patch 0148 then adds
 DYLD_INSERT_LIBRARIES when backboardd starts: iOS's launchd drops DYLD_* from
@@ -27,6 +27,7 @@ BB = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
 PLIST = '/System/Library/xpc/launchd.plist'
 ORIG = '/private/var/a51gpu/launchd.plist.orig'
 SWITCH = '/private/var/a51gpu/gl-on'
+GLENV = '/private/var/a51gpu/gl.env'     # read by the shim at every backboardd start (hero_log.c)
 SHIM = '/private/var/a51gpu/lib/libheroeagl.dylib'
 KEYS = ('DYLD_INSERT_LIBRARIES', 'BGL_NODIRECT', 'HERO_GPU_BLIT')
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,7 +84,15 @@ def main():
         ssh(f'rm -f {PLIST}.new')
         sys.exit(f'upload hash mismatch ({got} != {want}); plist unchanged')
     ssh(f'chown 0:80 {PLIST}.new && chmod 644 {PLIST}.new && mv {PLIST}.new {PLIST} && sync')
+    # launchd reads launchd.plist only at boot; the shim reads gl.env at every
+    # start (the kernel sets HERO_LOG_STDERR=1, which makes it load the file).
+    env = [f'BGL_NODIRECT={"0" if "--direct" in args else "1"}',
+           f'HERO_GPU_BLIT={"1" if "--blit" in args else "0"}']
+    if '--debug' in args:
+        env.append('EAGL_SHIM_DEBUG=1')
+    ssh(f'cat > {GLENV} && chmod 644 {GLENV}', ('\n'.join(env) + '\n').encode())
     ssh(f'touch {SWITCH}' if args[0] == 'on' else f'rm -f {SWITCH}')
+    print('gl.env:', ' '.join(env))
     print('now:', status(ssh(f'cat {PLIST}')), '| gl-on', 'set' if args[0] == 'on' else 'removed')
     if '--no-restart' not in args:
         # launchd restarts it (KeepAlive); the kernel logs "A51 GL: backboardd exec N"
