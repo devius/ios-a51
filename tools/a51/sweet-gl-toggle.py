@@ -3,8 +3,11 @@
 
   sweet-gl-toggle.py on|off|status [--blit] [--direct]
 
-Edits backboardd's job in the phone's /System/Library/xpc/launchd.plist
-(read at boot: reboot afterwards; a reboot writes no partition):
+Sets the switch file /private/var/a51gpu/gl-on (kernel patch 0148 then adds
+DYLD_INSERT_LIBRARIES when backboardd starts: iOS's launchd drops DYLD_* from
+jobs) and restarts backboardd, and edits backboardd's job in the phone's
+/System/Library/xpc/launchd.plist for the shim's other variables (read at
+boot):
   on   DYLD_INSERT_LIBRARIES=/private/var/a51gpu/lib/libheroeagl.dylib, and the
        shim's GPU paths that start off: BGL_NODIRECT=1, HERO_GPU_BLIT=0
        (--blit sets HERO_GPU_BLIT=1, --direct sets BGL_NODIRECT=0)
@@ -23,6 +26,7 @@ import sys
 BB = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
 PLIST = '/System/Library/xpc/launchd.plist'
 ORIG = '/private/var/a51gpu/launchd.plist.orig'
+SWITCH = '/private/var/a51gpu/gl-on'
 SHIM = '/private/var/a51gpu/lib/libheroeagl.dylib'
 KEYS = ('DYLD_INSERT_LIBRARIES', 'BGL_NODIRECT', 'HERO_GPU_BLIT')
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,7 +83,12 @@ def main():
         ssh(f'rm -f {PLIST}.new')
         sys.exit(f'upload hash mismatch ({got} != {want}); plist unchanged')
     ssh(f'chown 0:80 {PLIST}.new && chmod 644 {PLIST}.new && mv {PLIST}.new {PLIST} && sync')
-    print('now:', status(ssh(f'cat {PLIST}')), '- reboot for launchd to read it')
+    ssh(f'touch {SWITCH}' if args[0] == 'on' else f'rm -f {SWITCH}')
+    print('now:', status(ssh(f'cat {PLIST}')), '| gl-on', 'set' if args[0] == 'on' else 'removed')
+    if '--no-restart' not in args:
+        # launchd restarts it (KeepAlive); the kernel logs "A51 GL: backboardd exec N"
+        ssh('kill $(ps -axo pid=,comm= | grep "/usr/libexec/backboardd$" | sed "s/^ *//;s/ .*//")')
+        print('backboardd restarted')
 
 
 if __name__ == '__main__':

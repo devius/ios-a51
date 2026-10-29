@@ -1,0 +1,130 @@
+A51 GPU UI: exec adds DYLD_INSERT_LIBRARIES for backboardd (launchd dropped it).
+
+Boot 43: with DYLD_INSERT_LIBRARIES, BGL_NODIRECT and HERO_GPU_BLIT in
+backboardd's launchd job, the process had the last two but not the DYLD_*
+one, and the shim never loaded although 0146 answered dyld "allowed". As
+the S7 port's 0245 did (where the shim then ran in backboardd), exec now
+appends DYLD_INSERT_LIBRARIES=/private/var/a51gpu/lib/libheroeagl.dylib and
+HERO_LOG_STDERR=1 when /usr/libexec/backboardd starts, if
+/private/var/a51gpu/gl-on and the shim exist, a51gl is not 0, and only for
+the first 2 launches per boot; each exec is logged ("A51 GL: backboardd
+exec N: ..."). Switching is now a file plus a backboardd restart.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index deccec2..1e4f683 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5741,6 +5741,27 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* bsd/kern/sweet_amfi.c: the EAGL shim for the A51's backboardd. */
++	{
++		extern int a51_gl_env(const char *path, const char **extra, int max);
++		const char *extra[2];
++		int n = a51_gl_env(imgp->ip_strings + strlen(EXECUTABLE_KEY), extra, 2);
++		for (int i = 0; i < n; i++) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(extra[i]), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index f0e57f7..65752da 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -34,6 +34,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/vnode.h>
+ #include <sys/errno.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -435,6 +436,59 @@ a51_gl_dyld_flags(struct proc *p)
+ 	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
+ }
+ 
++/*
++ * The variable itself: iOS's launchd did not pass DYLD_INSERT_LIBRARIES from
++ * backboardd's job (boot 43: BGL_NODIRECT/HERO_GPU_BLIT from the same job
++ * arrived, the DYLD_* one did not), so, as the S7's 0245 did, exec adds it
++ * when /usr/libexec/backboardd starts: only if /private/var/a51gpu/gl-on and
++ * the shim exist (switch: create/remove gl-on, restart backboardd), a51gl is
++ * not 0, and for the first 2 launches per boot.
++ */
++#define A51_GL_TARGET   "/usr/libexec/backboardd"
++#define A51_GL_SHIM     "/private/var/a51gpu/lib/libheroeagl.dylib"
++#define A51_GL_SWITCH   "/private/var/a51gpu/gl-on"
++static int a51_gl_exec_launches;
++
++int a51_gl_env(const char *path, const char **extra, int max);
++
++static bool
++a51_gl_exists(const char *path)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++int
++a51_gl_env(const char *path, const char **extra, int max)
++{
++	if (path == NULL || strcmp(path, A51_GL_TARGET) != 0 || max < 2) {
++		return 0;
++	}
++	if (a51_gl_mode < 0) {
++		a51_gl_mode = 1;
++		PE_parse_boot_argn("a51gl", &a51_gl_mode, sizeof(a51_gl_mode));
++	}
++	int launch = ++a51_gl_exec_launches;
++	if (!a51_gl_mode || !a51_gl_exists(A51_GL_SWITCH)) {
++		printf("A51 GL: backboardd exec %d: CPU renderer (a51gl=%d, %s %s)\n", launch, a51_gl_mode,
++		    A51_GL_SWITCH, a51_gl_mode ? "absent" : "not checked");
++		return 0;
++	}
++	if (launch > A51_GL_MAX_LAUNCHES || !a51_gl_exists(A51_GL_SHIM)) {
++		printf("A51 GL: backboardd exec %d: CPU renderer (%s)\n", launch,
++		    launch > A51_GL_MAX_LAUNCHES ? "crash-loop guard" : "no " A51_GL_SHIM);
++		return 0;
++	}
++	extra[0] = "DYLD_INSERT_LIBRARIES=" A51_GL_SHIM;
++	extra[1] = "HERO_LOG_STDERR=1";
++	printf("A51 GL: backboardd exec %d: EAGL shim inserted\n", launch);
++	return 2;
++}
++
+ static int
+ a51_amfi_dyld_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -464,6 +518,13 @@ static struct mac_policy_conf a51_amfi_dyld_mac_conf = {
+ };
+ 
+ static mac_policy_handle_t a51_amfi_dyld_mac_handle;
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
++int a51_gl_env(const char *path, const char **extra, int max);
++int
++a51_gl_env(__unused const char *path, __unused const char **extra, __unused int max)
++{
++	return 0;
++}
+ #endif /* A5XELTE && A51 */
+ 
+ /* Called from bsd_init once MAC policies can register, before any exec. */

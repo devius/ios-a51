@@ -23,5 +23,9 @@ grep -qE '\(1ull? *<< *0\)' "$a" && grep -qE '\(1ull? *<< *1\)' "$a" && grep -qE
 	fail "dyld flag bits 0,1,5 missing"
 grep -q 'a51fps' "$x/iokit/Kernel/arm/SweetFramebuffer.cpp" && grep -q 'presents/s' "$x/iokit/Kernel/arm/SweetFramebuffer.cpp" ||
 	fail "SweetFramebuffer has no a51fps presents/s counter"
+# 0148: exec adds DYLD_INSERT_LIBRARIES for backboardd (launchd dropped it).
+grep -q 'a51_gl_env' "$x/bsd/kern/kern_exec.c" || fail "kern_exec.c does not call a51_gl_env"
+grep -q '/private/var/a51gpu/gl-on' "$a" && grep -q 'DYLD_INSERT_LIBRARIES=" A51_GL_SHIM' "$a" ||
+	fail "a51_gl_env lacks the gl-on switch or the DYLD_INSERT_LIBRARIES string"
 [[ $ok == 0 ]] && echo "gl patch checks passed"
 exit $ok
