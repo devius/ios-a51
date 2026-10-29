@@ -1,0 +1,156 @@
+A51 GPU UI: dyld answer bound to the shim's backboardd; guard trips on crash loops only.
+
+Boot 44: the guard counted every backboardd start (2 per boot), so a few
+deliberate on/off tests used it up and further GPU tests needed a reboot.
+Now exec records the pid it gave the shim to (passed from posix_spawn's
+context, as the S7's 0246) and only that process gets dyld's "allowed";
+the guard sends backboardd to the CPU renderer only after more than 2 shim
+launches each within 60 s of the previous one (a crash loop).
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 1e4f683..2cae6b0 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5744,9 +5744,11 @@ exec_extract_strings(struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* bsd/kern/sweet_amfi.c: the EAGL shim for the A51's backboardd. */
+ 	{
+-		extern int a51_gl_env(const char *path, const char **extra, int max);
++		extern int a51_gl_env(const char *path, int pid, const char **extra, int max);
+ 		const char *extra[2];
+-		int n = a51_gl_env(imgp->ip_strings + strlen(EXECUTABLE_KEY), extra, 2);
++		/* posix_spawn runs this on the parent's thread: the new process is the context's (S7 0246). */
++		int n = a51_gl_env(imgp->ip_strings + strlen(EXECUTABLE_KEY),
++		    proc_getpid(vfs_context_proc(imgp->ip_vfs_context)), extra, 2);
+ 		for (int i = 0; i < n; i++) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(extra[i]), UIO_SYSSPACE, TRUE);
+ 			if (error) {
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 65752da..c71191c 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -36,6 +36,8 @@
+ #include <sys/codesign.h>
+ #include <sys/vnode.h>
+ #include <sys/errno.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <sys/mount.h>
+@@ -400,15 +402,22 @@ static mac_policy_handle_t sweet_amfi_mac_handle;
+  * shim then gives way to the CPU renderer, as the S7's 0245 guard did); boot-arg
+  * a51gl=0 turns it off. Every other call keeps failing with ENOPOLICY, exactly
+  * as with no policy. From the S7 port's 0246.
++ *
++ * 0149: only the backboardd process exec gave the shim to (a51_gl_pid) gets
++ * the answer, and the guard trips on a crash loop, not on deliberate
++ * switching: more than A51_GL_MAX_LAUNCHES shim launches each within
++ * A51_GL_LOOP_SECS of the previous one (boot 44 ran out of its 2 launches
++ * per boot after a few on/off tests).
+  */
+ #define A51_GL_MAX_LAUNCHES                             2
++#define A51_GL_LOOP_SECS                                60
+ #define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ull << 0)
+ #define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ull << 1)
+ #define AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION (1ull << 5)
+ 
+ static int a51_gl_mode = -1;            /* boot-arg a51gl, default 1 */
+-static int a51_gl_launches;
+-static int a51_gl_pid = -1;
++static int a51_gl_pid = -1;             /* the backboardd that got the shim */
++static int a51_gl_answered_pid = -1;
+ 
+ static uint64_t
+ a51_gl_dyld_flags(struct proc *p)
+@@ -420,17 +429,12 @@ a51_gl_dyld_flags(struct proc *p)
+ 	char name[32];
+ 	int pid = proc_pid(p);
+ 	proc_name(pid, name, sizeof(name));
+-	if (!a51_gl_mode || strcmp(name, "backboardd") != 0) {
++	if (!a51_gl_mode || strcmp(name, "backboardd") != 0 || pid != a51_gl_pid) {
+ 		return 0;
+ 	}
+-	if (pid != a51_gl_pid) {
+-		a51_gl_pid = pid;
+-		a51_gl_launches++;
+-		printf("A51 GL: backboardd launch %d (pid %d): DYLD_* %s\n", a51_gl_launches, pid,
+-		    a51_gl_launches <= A51_GL_MAX_LAUNCHES ? "allowed" : "ignored (crash-loop guard)");
+-	}
+-	if (a51_gl_launches > A51_GL_MAX_LAUNCHES) {
+-		return 0;
++	if (pid != a51_gl_answered_pid) {
++		a51_gl_answered_pid = pid;
++		printf("A51 GL: backboardd pid %d: DYLD_* allowed\n", pid);
+ 	}
+ 	return AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+ 	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
+@@ -442,14 +446,16 @@ a51_gl_dyld_flags(struct proc *p)
+  * arrived, the DYLD_* one did not), so, as the S7's 0245 did, exec adds it
+  * when /usr/libexec/backboardd starts: only if /private/var/a51gpu/gl-on and
+  * the shim exist (switch: create/remove gl-on, restart backboardd), a51gl is
+- * not 0, and for the first 2 launches per boot.
++ * not 0, and unless it is crash-looping (see A51_GL_LOOP_SECS above).
+  */
+ #define A51_GL_TARGET   "/usr/libexec/backboardd"
+ #define A51_GL_SHIM     "/private/var/a51gpu/lib/libheroeagl.dylib"
+ #define A51_GL_SWITCH   "/private/var/a51gpu/gl-on"
+ static int a51_gl_exec_launches;
++static int a51_gl_streak;               /* shim launches in quick succession */
++static uint64_t a51_gl_last_insert;     /* mach_absolute_time of the last one */
+ 
+-int a51_gl_env(const char *path, const char **extra, int max);
++int a51_gl_env(const char *path, int pid, const char **extra, int max);
+ 
+ static bool
+ a51_gl_exists(const char *path)
+@@ -463,7 +469,7 @@ a51_gl_exists(const char *path)
+ }
+ 
+ int
+-a51_gl_env(const char *path, const char **extra, int max)
++a51_gl_env(const char *path, int pid, const char **extra, int max)
+ {
+ 	if (path == NULL || strcmp(path, A51_GL_TARGET) != 0 || max < 2) {
+ 		return 0;
+@@ -478,14 +484,24 @@ a51_gl_env(const char *path, const char **extra, int max)
+ 		    A51_GL_SWITCH, a51_gl_mode ? "absent" : "not checked");
+ 		return 0;
+ 	}
+-	if (launch > A51_GL_MAX_LAUNCHES || !a51_gl_exists(A51_GL_SHIM)) {
+-		printf("A51 GL: backboardd exec %d: CPU renderer (%s)\n", launch,
+-		    launch > A51_GL_MAX_LAUNCHES ? "crash-loop guard" : "no " A51_GL_SHIM);
++	if (!a51_gl_exists(A51_GL_SHIM)) {
++		printf("A51 GL: backboardd exec %d: CPU renderer (no " A51_GL_SHIM ")\n", launch);
+ 		return 0;
+ 	}
++	uint64_t now = mach_absolute_time(), ns = 0;
++	absolutetime_to_nanoseconds(now - a51_gl_last_insert, &ns);
++	a51_gl_streak = (a51_gl_last_insert != 0 && ns < A51_GL_LOOP_SECS * NSEC_PER_SEC) ? a51_gl_streak + 1 : 1;
++	a51_gl_last_insert = now;
++	if (a51_gl_streak > A51_GL_MAX_LAUNCHES) {
++		printf("A51 GL: backboardd exec %d: CPU renderer (crash-loop guard: %d shim launches within %d s)\n",
++		    launch, a51_gl_streak, A51_GL_LOOP_SECS);
++		a51_gl_pid = -1;
++		return 0;
++	}
++	a51_gl_pid = pid;
+ 	extra[0] = "DYLD_INSERT_LIBRARIES=" A51_GL_SHIM;
+ 	extra[1] = "HERO_LOG_STDERR=1";
+-	printf("A51 GL: backboardd exec %d: EAGL shim inserted\n", launch);
++	printf("A51 GL: backboardd exec %d (pid %d): EAGL shim inserted\n", launch, pid);
+ 	return 2;
+ }
+ 
+@@ -519,9 +535,9 @@ static struct mac_policy_conf a51_amfi_dyld_mac_conf = {
+ 
+ static mac_policy_handle_t a51_amfi_dyld_mac_handle;
+ #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+-int a51_gl_env(const char *path, const char **extra, int max);
++int a51_gl_env(const char *path, int pid, const char **extra, int max);
+ int
+-a51_gl_env(__unused const char *path, __unused const char **extra, __unused int max)
++a51_gl_env(__unused const char *path, __unused int pid, __unused const char **extra, __unused int max)
+ {
+ 	return 0;
+ }

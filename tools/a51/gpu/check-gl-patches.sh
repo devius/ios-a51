@@ -27,5 +27,10 @@ grep -q 'a51fps' "$x/iokit/Kernel/arm/SweetFramebuffer.cpp" && grep -q 'presents
 grep -q 'a51_gl_env' "$x/bsd/kern/kern_exec.c" || fail "kern_exec.c does not call a51_gl_env"
 grep -q '/private/var/a51gpu/gl-on' "$a" && grep -q 'DYLD_INSERT_LIBRARIES=" A51_GL_SHIM' "$a" ||
 	fail "a51_gl_env lacks the gl-on switch or the DYLD_INSERT_LIBRARIES string"
+# 0149: the dyld answer only for the backboardd exec gave the shim to; the guard
+# trips on a crash loop (shim launches in quick succession), not on switching.
+grep -q 'pid != a51_gl_pid' "$a" || fail "dyld answer not bound to the shim's backboardd pid"
+grep -q 'A51_GL_LOOP_SECS' "$a" && grep -q 'a51_gl_streak' "$a" || fail "guard does not time shim launches"
+grep -q 'proc_getpid(vfs_context_proc(imgp->ip_vfs_context))' "$x/bsd/kern/kern_exec.c" || fail "exec does not pass the new pid"
 [[ $ok == 0 ]] && echo "gl patch checks passed"
 exit $ok
