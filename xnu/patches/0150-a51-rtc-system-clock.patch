@@ -1,0 +1,216 @@
+A51: set the system clock from the PMIC RTC at boot.
+
+Without an RTC driver iOS boots in 1970 (boot 45: "Wed Dec 31 16:06:31 PST
+1969", load average 20 while idle); Bergamota found the later jump to the
+real date keeping coreduetd at ~75% of a core. bsd/dev/a51_rtc.c reads the
+S2MPU09 RTC over SPEEDY (slave 0x02; update latch RUDR, then the time
+registers, as the A51 kernel's rtc-s2mpu09.c) before userland starts and
+calls clock_set_calendar_microtime. Both register layouts of rtc-s2mp.h are
+tried, implausible dates are refused, only the update latch is written.
+Boot-arg a51rtc=0: off. Date math host-tested.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 246fee0..0e8c189 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a51_gpu.c			standard
++bsd/dev/a51_rtc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a51_rtc.c b/bsd/dev/a51_rtc.c
+new file mode 100644
+index 0000000..8b9c5da
+--- /dev/null
++++ b/bsd/dev/a51_rtc.c
+@@ -0,0 +1,166 @@
++/*
++ * A51 (Galaxy A51, Exynos 9611): set the system clock from the PMIC's RTC.
++ *
++ * Without an RTC driver iOS boots in 1970 (boot 45: "Wed Dec 31 16:06:31 PST
++ * 1969", load average 20 on an idle phone). Bergamota's Poco F1 port found
++ * the later jump to the real date kept coreduetd at ~75% of a core. The A51's
++ * RTC is in the S2MPU09 PMIC, SPEEDY slave 0x02 (s2mpu09-core.c I2C_ADDR_RTC);
++ * Android keeps it in UTC. Read sequence from the A51 kernel's rtc-s2mpu09.c:
++ * UPDATE (0x02) |= RUDR (bit 0), wait 1 ms, then sec, min, hour (& 0x1f, 24 h),
++ * weekday (one-hot), day, month, year (+2000), binary. rtc-s2mp.h has two
++ * layouts (seconds at 0x04, or msec at 0x04 and seconds at 0x05): 0x04..0x0b
++ * are read and the layout that gives a plausible date is used. The SPEEDY
++ * sequence is the shim's (shim/a51/pmic.c, proven on the phone) plus the
++ * bootloader's random-access write (lk3rd speedy_multi.c). Nothing but the
++ * update latch is written. Boot-arg a51rtc=0: off.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++void a51_rtc_set_clock(void);
++
++#if defined(A51)
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SPEEDY_PA               0x11a10000u
++#define SPEEDY_CTRL             0x000
++#define SPEEDY_FIFO_CTRL        0x004
++#define SPEEDY_CMD              0x008
++#define SPEEDY_INT_ENABLE       0x00c
++#define SPEEDY_INT_STATUS       0x010
++#define SPEEDY_TX_DATA          0x034
++#define SPEEDY_RX_DATA          0x038
++#define SPEEDY_ENABLE           (1u << 0)
++#define SPEEDY_FIFO_RESET       (1u << 31)
++#define SPEEDY_TRANSFER_DONE    (1u << 0)
++#define SPEEDY_ACCESS_RANDOM    (1u << 19)
++#define SPEEDY_DIRECTION_WRITE  (1u << 20)
++#define SPEEDY_TIMEOUT_EN       (7u << 1)       /* cmd, standby, data */
++#define SPEEDY_RX_EN            ((1u << 8) | (1u << 9))
++#define SPEEDY_TX_EN            ((1u << 0) | (1u << 4))
++
++#define RTC_SLAVE               0x02
++#define RTC_UPDATE              0x02
++#define RTC_RUDR                (1u << 0)
++
++static vm_offset_t a51_speedy;
++
++static uint32_t
++a51_spd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(a51_speedy + off);
++}
++
++static void
++a51_spd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a51_speedy + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* One random-access transfer; the byte read (0..255), 0 after a write, -1 on timeout. */
++static int
++a51_speedy_xfer(uint8_t slave, uint8_t reg, bool write, uint8_t data)
++{
++	uint32_t addr = reg | ((uint32_t)(slave & 0xf) << 8);
++	a51_spd_wr(SPEEDY_FIFO_CTRL, a51_spd_rd(SPEEDY_FIFO_CTRL) | SPEEDY_FIFO_RESET);
++	delay(10);
++	a51_spd_wr(SPEEDY_FIFO_CTRL, (a51_spd_rd(SPEEDY_FIFO_CTRL) & ~0xffffu) | 1u | (1u << 8));
++	a51_spd_wr(SPEEDY_INT_STATUS, 0xffffffffu);
++	a51_spd_wr(SPEEDY_INT_ENABLE, SPEEDY_TIMEOUT_EN | (write ? SPEEDY_TX_EN : SPEEDY_RX_EN));
++	a51_spd_wr(SPEEDY_CMD, ((addr & 0xfff) << 7) | SPEEDY_ACCESS_RANDOM | (write ? SPEEDY_DIRECTION_WRITE : 0));
++	if (write) {
++		a51_spd_wr(SPEEDY_TX_DATA, data);
++	}
++	for (int i = 0; i < 10000; i++) {
++		if (a51_spd_rd(SPEEDY_INT_STATUS) & SPEEDY_TRANSFER_DONE) {
++			int v = write ? 0 : (int)(a51_spd_rd(SPEEDY_RX_DATA) & 0xffu);
++			a51_spd_wr(SPEEDY_INT_STATUS, 0xffffffffu);
++			return v;
++		}
++		delay(1);
++	}
++	a51_spd_wr(SPEEDY_INT_STATUS, 0xffffffffu);
++	return -1;
++}
++
++/* Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil). */
++static int64_t
++a51_days_from_civil(int64_t y, unsigned m, unsigned d)
++{
++	y -= m <= 2;
++	int64_t era = (y >= 0 ? y : y - 399) / 400;
++	unsigned yoe = (unsigned)(y - era * 400);
++	unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
++	unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++	return era * 146097 + (int64_t)doe - 719468;
++}
++
++/* r[0..6] = sec, min, hour, weekday, day, month, year: seconds since the epoch, or 0 if implausible. */
++static uint64_t
++a51_rtc_epoch(const int *r)
++{
++	unsigned sec = r[0] & 0x7f, min = r[1] & 0x7f, hour = r[2] & 0x1f;
++	unsigned wday = r[3] & 0x7f, day = r[4] & 0x1f, mon = r[5] & 0x0f, year = (r[6] & 0x7f) + 2000;
++	if (sec > 59 || min > 59 || hour > 23 || wday == 0 || (wday & (wday - 1)) ||
++	    day < 1 || day > 31 || mon < 1 || mon > 12 || year < 2024 || year > 2099) {
++		return 0;
++	}
++	return (uint64_t)a51_days_from_civil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec;
++}
++
++void
++a51_rtc_set_clock(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("a51rtc", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	a51_speedy = ml_io_map(SPEEDY_PA, 0x1000);
++	if (!a51_speedy) {
++		printf("A51 RTC: SPEEDY mapping failed\n");
++		return;
++	}
++	if (!(a51_spd_rd(SPEEDY_CTRL) & SPEEDY_ENABLE)) {
++		a51_spd_wr(SPEEDY_CTRL, a51_spd_rd(SPEEDY_CTRL) | SPEEDY_ENABLE);
++	}
++	int upd = a51_speedy_xfer(RTC_SLAVE, RTC_UPDATE, false, 0);
++	if (upd < 0 || a51_speedy_xfer(RTC_SLAVE, RTC_UPDATE, true, (uint8_t)(upd | RTC_RUDR)) < 0) {
++		printf("A51 RTC: SPEEDY timeout (update %d)\n", upd);
++		return;
++	}
++	delay(1000);
++	int raw[8];
++	for (int i = 0; i < 8; i++) {
++		raw[i] = a51_speedy_xfer(RTC_SLAVE, (uint8_t)(0x04 + i), false, 0);
++		if (raw[i] < 0) {
++			printf("A51 RTC: SPEEDY timeout at register %#x\n", 0x04 + i);
++			return;
++		}
++	}
++	uint64_t at04 = a51_rtc_epoch(&raw[0]), at05 = a51_rtc_epoch(&raw[1]);
++	uint64_t secs = at05 ? at05 : at04;
++	printf("A51 RTC: regs 04-0b %02x %02x %02x %02x %02x %02x %02x %02x -> %s layout\n",
++	    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
++	    at05 ? "msec@04" : at04 ? "sec@04" : "no plausible");
++	if (!secs) {
++		return;
++	}
++	clock_set_calendar_microtime((clock_sec_t)secs, 0);
++	const int *t = at05 ? &raw[1] : &raw[0];
++	printf("A51 RTC: clock set to %04d-%02d-%02d %02d:%02d:%02d UTC\n", (t[6] & 0x7f) + 2000,
++	    t[5] & 0x0f, t[4] & 0x1f, t[2] & 0x1f, t[1] & 0x7f, t[0] & 0x7f);
++}
++#else /* !A51 */
++void
++a51_rtc_set_clock(void)
++{
++}
++#endif /* A51 */
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 4f927df..2ee4393 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -72,6 +72,7 @@ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a51_gpu_probe(void);
++extern void a51_rtc_set_clock(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -773,6 +774,8 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* System clock from the PMIC RTC before userland starts (bsd/dev/a51_rtc.c). */
++	a51_rtc_set_clock();
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ 	/* Mali-G72 probe and power (bsd/dev/a51_gpu.c; a no-op off the A51). */
