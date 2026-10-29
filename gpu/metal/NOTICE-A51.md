@@ -18,3 +18,8 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 ## Added files
 
 - check-vendor.sh
+- build-host.sh
+- host/air_bifrost.c
+- test/host/test_air_bifrost.sh
+- test/host/fixtures/quad.metal
+- test/host/fixtures/quad.metallib
