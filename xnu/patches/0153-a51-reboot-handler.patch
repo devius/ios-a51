@@ -7,9 +7,8 @@ SYSTEM_RESET (the EL3 firmware's normal reboot: S-Boot boots the boot
 partition again); with sysctl kern.a51_reboot_recovery=1 set first, or for
 panic restarts, the recovery magic + SWRESET (TWRP). Shutdown: PSCI
 SYSTEM_OFF. Registered by the touch probe, which maps the PMU at boot.
-
 diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
-index 8720392..ed1098d 100644
+index 8720392..ead2477 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
 @@ -14,6 +14,7 @@
@@ -20,10 +19,11 @@ index 8720392..ed1098d 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void thread_terminate_self(void);
-@@ -1330,6 +1331,57 @@ a51_panic_recovery_reset(void)
+@@ -1330,6 +1331,59 @@ a51_panic_recovery_reset(void)
  	a5touch_write(a51_panic_pmu, 0x400, 1u);  /* EXYNOS_SWRESET */
  }
  
++#if defined(A51)
 +/*
 + * Reboot and shutdown (A51): nothing set PE_halt_restart, so
 + * IOPlatformExpert::haltRestart() returned -1 and a reboot from iOS hung.
@@ -74,16 +74,16 @@ index 8720392..ed1098d 100644
 +		__asm__ volatile ("wfe");
 +	}
 +}
++#endif /* A51 */
 +
  void
  a5xelte_touch_probe(void)
  {
-@@ -1339,7 +1391,7 @@ a5xelte_touch_probe(void)
+@@ -1339,6 +1393,7 @@ a5xelte_touch_probe(void)
  	if (panic_reset) {
  		a51_panic_pmu = ml_io_map(0x11860000u, 0x1000);
  	}
--#endif
 +	PE_halt_restart = a51_halt_restart;
+ #endif
  #if defined(DREAMLTE)
  	dreamlte_touch_start();   /* the A5 path below stays off */
- #endif
