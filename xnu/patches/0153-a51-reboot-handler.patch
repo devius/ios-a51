@@ -1,0 +1,89 @@
+A51: reboot and shutdown from iOS (PE_halt_restart).
+
+Nothing set PE_halt_restart on this port, so IOPlatformExpert::haltRestart()
+returned -1 and a reboot from iOS (Procursus /var/jb/sbin/reboot) hung; the
+only way back was the touch corner gesture into TWRP. Restart now uses PSCI
+SYSTEM_RESET (the EL3 firmware's normal reboot: S-Boot boots the boot
+partition again); with sysctl kern.a51_reboot_recovery=1 set first, or for
+panic restarts, the recovery magic + SWRESET (TWRP). Shutdown: PSCI
+SYSTEM_OFF. Registered by the touch probe, which maps the PMU at boot.
+
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 8720392..ed1098d 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -14,6 +14,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void thread_terminate_self(void);
+@@ -1330,6 +1331,57 @@ a51_panic_recovery_reset(void)
+ 	a5touch_write(a51_panic_pmu, 0x400, 1u);  /* EXYNOS_SWRESET */
+ }
+ 
++/*
++ * Reboot and shutdown (A51): nothing set PE_halt_restart, so
++ * IOPlatformExpert::haltRestart() returned -1 and a reboot from iOS hung.
++ * Restart: PSCI SYSTEM_RESET (0x84000009, the EL3 firmware's normal reboot:
++ * S-Boot then boots the boot partition again); with sysctl
++ * kern.a51_reboot_recovery=1 set before it, the recovery magic + SWRESET of
++ * a51_panic_recovery_reset() instead (TWRP). Shutdown: PSCI SYSTEM_OFF.
++ * Types as IOPlatformExpert.h's enum.
++ */
++#define A51_PE_HALT             0       /* kPEHaltCPU */
++#define A51_PE_RESTART          1       /* kPERestartCPU */
++#define A51_PE_PANIC_RESTART    4       /* kPEPanicRestartCPU */
++#define A51_PE_PANIC_SYNC       5       /* kPEPanicSync */
++#define A51_PE_PANIC_RESTART_NC 9       /* kPEPanicRestartCPUNoCallouts */
++extern int (*PE_halt_restart)(unsigned int type);
++static int a51_reboot_recovery;
++SYSCTL_INT(_kern, OID_AUTO, a51_reboot_recovery, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &a51_reboot_recovery, 0, "A51: the next reboot goes to recovery (TWRP)");
++
++static void
++a51_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++}
++
++static int
++a51_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case A51_PE_PANIC_SYNC:
++		return 0;
++	case A51_PE_RESTART:
++	case A51_PE_PANIC_RESTART:
++	case A51_PE_PANIC_RESTART_NC:
++		if (a51_reboot_recovery || type != A51_PE_RESTART) {
++			a51_panic_recovery_reset();     /* returns only without a PMU mapping */
++		}
++		a51_psci(0x84000009);           /* SYSTEM_RESET */
++		break;
++	case A51_PE_HALT:
++		a51_psci(0x84000008);           /* SYSTEM_OFF */
++		break;
++	default:
++		return -1;
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
+ void
+ a5xelte_touch_probe(void)
+ {
+@@ -1339,7 +1391,7 @@ a5xelte_touch_probe(void)
+ 	if (panic_reset) {
+ 		a51_panic_pmu = ml_io_map(0x11860000u, 0x1000);
+ 	}
+-#endif
++	PE_halt_restart = a51_halt_restart;
+ #if defined(DREAMLTE)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
+ #endif
