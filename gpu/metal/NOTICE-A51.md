@@ -16,6 +16,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 ## Changed files
 
 - tools/corpus.py
+- air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, freedreno-only parts guarded)
 
 ## Added files
 
@@ -27,3 +28,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - test/host/fixtures/quad.metallib
 - tools/test_corpus.py
 - results/ios16.7-bifrost.md
+- build-ios.sh
+- a51/sweet_drm_hero.c
+- test/a51/a51_device_test.c
+- test/a51/a51_kernels.metal

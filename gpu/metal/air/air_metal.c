@@ -53,6 +53,13 @@
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
 #include <xf86drm.h>
+#elif defined(GALLIUM_PANFROST)
+/* A51: Panfrost over the kernel's HeroGPU service, through the libdrm stand-in
+ * gpu/mesa/herodrm.c; the screen comes from gpu/mesa/hero_hw.c, as OSMesa's does. */
+#include "frontend/winsys_handle.h"
+#include "drm-uapi/drm_fourcc.h"
+struct pipe_screen *hero_hw_create_screen(void);
+int herodrm_fault_count(void);
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
@@ -81,6 +88,8 @@
 
 struct rwa_device {
    struct pipe_screen *screen;
+   bool shared_screen;        /* A51: the process-wide Panfrost screen, never destroyed */
+   int faults_seen;           /* A51: herodrm_fault_count() at the last check */
    struct pipe_context *pipe;
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
@@ -569,6 +578,27 @@ rwa_device_open(char *why, size_t why_size)
          goto fail;
       }
    }
+#elif defined(GALLIUM_PANFROST)
+   if (!software) {
+      /* A51: one Panfrost screen per process, shared by every device (and never
+       * destroyed: rwa_device_close leaves it), because HeroGPU gives a process one
+       * GPU address space and QuartzCore and a probe may both open a device.
+       */
+      static struct pipe_screen *pan_screen;
+      static simple_mtx_t pan_screen_lock = SIMPLE_MTX_INITIALIZER;
+      simple_mtx_lock(&pan_screen_lock);
+      if (!pan_screen)
+         pan_screen = hero_hw_create_screen();
+      simple_mtx_unlock(&pan_screen_lock);
+      if (!pan_screen) {
+         say(why, why_size, "there is no GPU here: no HeroGPU service to open (kernel "
+                            "booted without a51gpu=3?), or Panfrost made no screen for it");
+         goto fail;
+      }
+      device->screen = pan_screen;
+      device->shared_screen = true;
+      device->faults_seen = herodrm_fault_count();
+   }
 #else
    if (!software) {
       say(why, why_size, "this build of the library has no GPU driver in it, only "
@@ -642,7 +672,7 @@ rwa_device_open(char *why, size_t why_size)
 fail:
    if (device->pipe)
       device->pipe->destroy(device->pipe);
-   if (device->screen)
+   if (device->screen && !device->shared_screen)
       device->screen->destroy(device->screen);
    free(device);
    glsl_type_singleton_decref();
@@ -657,7 +687,8 @@ rwa_device_close(struct rwa_device *device)
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    device->pipe->destroy(device->pipe);
-   device->screen->destroy(device->screen);
+   if (!device->shared_screen)
+      device->screen->destroy(device->screen);
    free(device);
    glsl_type_singleton_decref();
 }
@@ -3511,6 +3542,30 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
  * whether the GPU finished, and that is a failure. rwa_finish may be called with
  * nothing outstanding at all, and then no fence means there was nothing to wait for.
  */
+/* A51: a faulted job still signals its fence (Panfrost logs the failed submit and
+ * goes on), so a finished wait is not a result: herodrm counts the jobs the GPU
+ * faulted, process-wide, and a count that grew since the last check fails the wait.
+ * A fault of another device in the process is reported here too, which errs on the
+ * side of an error.
+ */
+static bool
+gpu_faulted(struct rwa_device *device, const char *what, char *why, size_t why_size)
+{
+#ifdef GALLIUM_PANFROST
+   if (device->shared_screen) {
+      int now = herodrm_fault_count();
+      if (now != device->faults_seen) {
+         say(why, why_size, "the GPU faulted on the %s (%d job fault%s, see the kernel log): "
+                            "the buffers hold what was there before, not a result",
+             what, now - device->faults_seen, now - device->faults_seen == 1 ? "" : "s");
+         device->faults_seen = now;
+         return true;
+      }
+   }
+#endif
+   return false;
+}
+
 static int
 finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                   char *why, size_t why_size)
@@ -3541,6 +3596,8 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                          "dispatch in it is vacuous too", what);
       return -1;
    }
+   if (gpu_faulted(device, what, why, why_size))
+      return -1;
    return 0;
 }
 
@@ -4443,6 +4500,8 @@ rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, si
       say(why, why_size, "the GPU did not finish the work within the fence timeout");
       return -1;
    }
+   if (gpu_faulted(device, "work", why, why_size))
+      return -1;
    return 0;
 }
 
@@ -7235,7 +7294,9 @@ fail:
 
 /* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
  * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
+#ifdef GALLIUM_FREEDRENO
 extern int fd_mesa_debug __attribute__((weak_import));
+#endif
 
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
@@ -7577,8 +7638,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * patched from the resource (patch_fb_read_sysmem) is exact. Sticky for the process: such a batch can be flushed
     * by a later call, and a client that fetches at all (CoreAnimation) does so every frame.
     */
+#ifdef GALLIUM_FREEDRENO   /* A51: Panfrost reads framebuffers natively (fbfetch_coherent) */
    if (render->finfo.fbfetch_targets && &fd_mesa_debug)
       fd_mesa_debug |= (1 << 9);
+#endif
 
    fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
 
