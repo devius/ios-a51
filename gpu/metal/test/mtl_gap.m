@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // What is still missing for a device CoreAnimation could use? For each of our Metal classes and each Metal protocol it is meant to
 // implement, count the REQUIRED instance methods that nothing in the class chain answers (class_respondsToSelector == NO), and the
-// ones answered only by Apple's own base class (inherited from _MTL*: real code or an abstract stub, see mtl_gap -s).
+// ones answered only by Apple's own base class (inherited from _MTL*: real code or an abstract stub, see mtl_gap -i).
 // Creates the objects directly (no registration, no IOKit). Software backend unless the GPU is healthy (RWA_SOFTWARE=1).
 //   mtl_gap            counts
 //   mtl_gap -v         every unanswered selector
@@ -23,7 +23,7 @@ report(const char *label, Class cls, const char *proto_name, int verbose)
    for (unsigned i = 0; i < n; i++) {
       if (!class_respondsToSelector(cls, d[i].name)) {
          missing++;
-         if (verbose) printf("    missing: %s\n", sel_getName(d[i].name));
+         if (verbose == 1) printf("    missing: %s\n", sel_getName(d[i].name));
          continue;
       }
       Method m = class_getInstanceMethod(cls, d[i].name);
@@ -34,6 +34,8 @@ report(const char *label, Class cls, const char *proto_name, int verbose)
       free(ml);
       (void)m;
       if (declared_here) own++; else inherited++;
+      /* A51: -i lists what only Apple's base class answers (real code or an abstract stub) */
+      if (verbose == 2 && !declared_here) printf("    inherited: %s\n", sel_getName(d[i].name));
    }
    free(d);
    printf("%-26s %-28s required=%-4u answered_by_us=%-3u inherited_from_Metal_base=%-4u UNANSWERED=%u\n", label, proto_name, n, own, inherited, missing);
@@ -43,7 +45,7 @@ int
 main(int argc, char **argv)
 {
    @autoreleasepool {
-      int v = argc > 1 && !strcmp(argv[1], "-v");
+      int v = argc > 1 && !strcmp(argv[1], "-v") ? 1 : argc > 1 && !strcmp(argv[1], "-i") ? 2 : 0;
       id dev = bgmtl_create_device();
       id q = [dev newCommandQueue];
       id cb = [q commandBuffer];

@@ -415,6 +415,63 @@ ensure_protocol(Class cls, const char *proto)
       BG_LOG("class_addProtocol(%s) refused for %s\n", proto, class_getName(cls));
 }
 
+// A51: MTLHeap. iOS 16's QuartzCore calls -newHeapWithDescriptor: (objc_msgSend$newHeapWithDescriptor: in its binary)
+// and Chlorophyll had none (mtl_gap on the phone). A heap
+// here sub-allocates nothing: each resource is the device's own buffer or texture, and the heap only keeps the
+// descriptor's numbers and a running total. Correct for every use that does not alias two resources in one heap
+// (makeAliasable is a no-op), at the cost of the memory a real heap would share.
+@interface BGMTLHeap : NSObject {
+@public
+   id _device;
+   NSString *_label;
+   NSUInteger _size, _used;
+   MTLStorageMode _storage;
+   MTLCPUCacheMode _cache;
+   MTLHazardTrackingMode _hazard;
+   MTLResourceOptions _options;
+   MTLHeapType _type;
+}
+@end
+
+@implementation BGMTLHeap
+- (void)dealloc { [_label release]; [super dealloc]; }
+- (id)device { return _device; }
+- (NSString *)label { return _label; }
+- (void)setLabel:(NSString *)l { [_label release]; _label = [l copy]; }
+- (MTLStorageMode)storageMode { return _storage; }
+- (MTLCPUCacheMode)cpuCacheMode { return _cache; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return _hazard; }
+- (MTLResourceOptions)resourceOptions { return _options; }
+- (MTLHeapType)type { return _type; }
+- (NSUInteger)size { return _size; }
+- (NSUInteger)usedSize { return _used; }
+- (NSUInteger)currentAllocatedSize { return _size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { (void)alignment; return _used < _size ? _size - _used : 0; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { (void)state; return MTLPurgeableStateNonVolatile; }
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+   id b = [_device newBufferWithLength:length options:options];
+   if (b) _used += [_device heapBufferSizeAndAlignWithLength:length options:options].size;
+   return b;
+}
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset
+{
+   (void)offset;
+   return [self newBufferWithLength:length options:options];
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d
+{
+   id t = [_device newTextureWithDescriptor:d];
+   if (t) _used += [_device heapTextureSizeAndAlignWithDescriptor:d].size;
+   return t;
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset
+{
+   (void)offset;
+   return [self newTextureWithDescriptor:d];
+}
+@end
+
 @implementation BGMTLDevice
 
 + (void)load
@@ -514,11 +571,36 @@ ensure_protocol(Class cls, const char *proto)
 // aligned to 64 bytes here (freedreno a6xx pitch alignment). The fallback answered 0 and SpringBoard's image upload
 // wrote past an ImageIO buffer into its guard page (KERN_PROTECTION_FAILURE in CGImageTextureDataGetOffsetWithBlock).
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+// A51: limits iOS 16's QuartzCore reads that only _MTLDevice answers, and it answers 0 for a device it did not
+// build (a51_device_limits). From the Mali / Panfrost and from air_metal.c: 8 colour attachments (rwa_render_shape),
+// 16 textures and samplers a stage (RWA_MAX_TEXTURES), 8192 a side (the panel is 1080x2400), 64-byte linear rows,
+// constant buffers at 256-byte offsets (Panfrost needs 16; 256 is also Metal's common rule).
+- (NSUInteger)maxColorAttachments { return 8; }
+- (NSUInteger)maxFragmentTextures { return 16; }
+- (NSUInteger)maxFragmentSamplers { return 16; }
+- (NSUInteger)maxTextureWidth2D { return 8192; }
+- (NSUInteger)maxTextureHeight2D { return 8192; }
+- (NSUInteger)minConstantBufferAlignmentBytes { return 256; }
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return 64; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
 // Heap sizing queries: page-aligned, and for textures an upper bound (16 bytes a texel, every mip level), never zero.
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
    (void)options;
    return (MTLSizeAndAlign){ (length + 0x3fff) & ~(NSUInteger)0x3fff, 0x4000 };
+}
+// A51: see BGMTLHeap.
+- (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d
+{
+   BGMTLHeap *h = [[BGMTLHeap alloc] init];
+   h->_device = self;
+   h->_size = d.size;
+   h->_storage = d.storageMode;
+   h->_cache = d.cpuCacheMode;
+   h->_hazard = d.hazardTrackingMode;
+   h->_options = d.resourceOptions;
+   h->_type = d.type;
+   return h;
 }
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d
 {
