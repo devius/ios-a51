@@ -46,7 +46,7 @@ for dep in $(otool -L "$OUT/lib/libairmetal.dylib" | awk 'NR > 1 { print $1 }');
   case "$dep" in /usr/lib/*|/System/*|@rpath/*) ;; *) install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$OUT/lib/libairmetal.dylib" ;; esac
 done
 DRM="$WORK/drm-standin/libdrm.2.dylib"
-for t in "$HERE/test/a51/a51_device_test.c" "$HERE/test/a51/a51_surface_test.c" "$HERE/test/bgair_test.c" "$HERE/test/bgair_vertex_test.c" "$HERE/test/a51/a51_render_diag.c"; do
+for t in "$HERE/test/a51/a51_device_test.c" "$HERE/test/a51/a51_surface_test.c" "$HERE/test/bgair_test.c" "$HERE/test/bgair_vertex_test.c" "$HERE/test/a51/a51_render_diag.c" "$HERE/test/a51/a51_surface_threads.c"; do
   $CC_IOS -O2 -Wall -I "$HERE/air" -o "$OUT/$(basename "$t" .c)" "$t" -L "$OUT/lib" -lairmetal "$DRM" -framework IOSurface -framework CoreFoundation \
     -Wl,-rpath,/private/var/a51gpu/lib
 done
@@ -68,5 +68,5 @@ $OBJC_IOS -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foun
 rm -f "$OUT/bgmtl.o"
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/bg_quad.metal" -o "$OUT/bg_quad.metallib"
 for p in $PROBES mtl_introspect; do codesign -s - -f "$OUT/$p"; done
-for f in "$OUT/lib/libairmetal.dylib" "$OUT/a51_device_test" "$OUT/a51_surface_test" "$OUT/bgair_test" "$OUT/bgair_vertex_test" "$OUT/a51_render_diag"; do codesign -s - -f "$f"; done
+for f in "$OUT/lib/libairmetal.dylib" "$OUT/a51_device_test" "$OUT/a51_surface_test" "$OUT/bgair_test" "$OUT/bgair_vertex_test" "$OUT/a51_render_diag" "$OUT/a51_surface_threads"; do codesign -s - -f "$f"; done
 otool -L "$OUT/lib/libairmetal.dylib"

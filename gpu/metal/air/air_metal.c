@@ -59,7 +59,7 @@
 #include "frontend/winsys_handle.h"
 #include "drm-uapi/drm_fourcc.h"
 struct pipe_screen *hero_hw_create_screen(void);
-int herodrm_fault_count(void);
+unsigned long long herodrm_fault_count(void);
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
@@ -89,7 +89,7 @@ int herodrm_fault_count(void);
 struct rwa_device {
    struct pipe_screen *screen;
    bool shared_screen;        /* A51: the process-wide Panfrost screen, never destroyed */
-   int faults_seen;           /* A51: herodrm_fault_count() at the last check */
+   unsigned long long faults_seen;   /* A51: herodrm_fault_count() at the last check */
    struct pipe_context *pipe;
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
@@ -1694,6 +1694,12 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       static struct { struct rwa_device *dev; int id; unsigned w, h; enum pipe_format f; struct rwa_sbo sb; struct pipe_resource *res;
                       uint64_t used; int prime; } sbo_cache[SBO_CACHE];
       static uint64_t sbo_clock;
+      /* A51: the cache is process-wide and backboardd imports from several threads; an
+       * eviction (which frees the BO and its descriptor) racing a lookup of the same slot
+       * made imports fail or crash (test/a51/a51_surface_threads.c). Held from lookup to
+       * insert; resource_from_handle is inside, so a hit and a miss never interleave. */
+      static simple_mtx_t sbo_lock = SIMPLE_MTX_INITIALIZER;
+      simple_mtx_lock(&sbo_lock);
       int sbo_slot = -1, sbo_victim = 0;
       for (int k = 0; k < SBO_CACHE; k++) {
          if (sbo_cache[k].res && sbo_cache[k].dev == device && sbo_cache[k].id == import->id && sbo_cache[k].w == width &&
@@ -1717,11 +1723,13 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
                             "was never made shareable", import->id, sr, sb.planes, sb.bytes_per_row);
          free(texture);
+         simple_mtx_unlock(&sbo_lock);
          return NULL;
       }
       if (sb.width < width || sb.height < height) {
          say(why, why_size, "IOSurface %d is %ux%u and the texture asks for %ux%u", import->id, sb.width, sb.height, width, height);
          free(texture);
+         simple_mtx_unlock(&sbo_lock);
          return NULL;
       }
       struct winsys_handle whandle = {
@@ -1757,6 +1765,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                             "than the image", import->id, import->row_bytes, width, texel,
              width * texel);
          free(texture);
+         simple_mtx_unlock(&sbo_lock);
          return NULL;
       }
       if (import->row_bytes % 64 != 0) {
@@ -1766,6 +1775,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                             "surfaces are aligned to 64 already)", import->id,
              import->row_bytes);
          free(texture);
+         simple_mtx_unlock(&sbo_lock);
          return NULL;
       }
 
@@ -1787,6 +1797,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                             "%u bytes a row", rwa_device_name(device), width, height,
              type_name, fmt->name, import->row_bytes);
          free(texture);
+         simple_mtx_unlock(&sbo_lock);
          return NULL;
       }
 
@@ -1801,6 +1812,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          sbo_cache[sbo_victim].used = ++sbo_clock;
          pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
       }
+      simple_mtx_unlock(&sbo_lock);
       if (!texture->res) {
          /*
           * Everything this side could check has been checked, so no reason is invented
@@ -3578,11 +3590,12 @@ gpu_faulted(struct rwa_device *device, const char *what, char *why, size_t why_s
 {
 #ifdef GALLIUM_PANFROST
    if (device->shared_screen) {
-      int now = herodrm_fault_count();
+      unsigned long long now = herodrm_fault_count();
       if (now != device->faults_seen) {
-         say(why, why_size, "the GPU faulted on the %s (%d job fault%s, see the kernel log): "
+         unsigned long long n = now - device->faults_seen;
+         say(why, why_size, "the GPU faulted on the %s (%llu job fault%s, see the kernel log): "
                             "the buffers hold what was there before, not a result",
-             what, now - device->faults_seen, now - device->faults_seen == 1 ? "" : "s");
+             what, n, n == 1 ? "" : "s");
          device->faults_seen = now;
          return true;
       }

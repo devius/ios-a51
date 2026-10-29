@@ -13,7 +13,7 @@
 #include <string.h>
 #include "air_metal.h"
 
-int herodrm_fault_count(void);
+unsigned long long herodrm_fault_count(void);
 
 static int pass, fail;
 #define CHECK(c, ...) do { if (c) { pass++; } else { fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -121,7 +121,7 @@ main(int argc, char **argv)
    }
 
    /* compute_fault_reported: poke writes 1 GiB past its buffer */
-   int faults0 = herodrm_fault_count();
+   unsigned long long faults0 = herodrm_fault_count();
    struct rwa_compute *poke = pipeline(dev, "poke");
    struct rwa_buffer *out = rwa_buffer_create(dev, 4096, why, sizeof(why));
    struct rwa_buffer *far = rwa_buffer_create(dev, 16, why, sizeof(why));
@@ -133,7 +133,7 @@ main(int argc, char **argv)
       why[0] = 0;
       int r = rwa_dispatch(poke, &bind, groups, size, why, sizeof(why));
       if (r == 0) r = rwa_finish(dev, why, sizeof(why));
-      printf("compute_fault_reported: r=%d why=\"%s\" faults %d -> %d\n", r, why, faults0, herodrm_fault_count());
+      printf("compute_fault_reported: r=%d why=\"%s\" faults %llu -> %llu\n", r, why, faults0, herodrm_fault_count());
       CHECK(r != 0 && why[0], "compute_fault_reported: the faulting dispatch returned %d", r);
       CHECK(herodrm_fault_count() > faults0, "compute_fault_reported: herodrm saw no fault");
    } else {
