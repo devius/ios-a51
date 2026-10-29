@@ -9,6 +9,7 @@
  * closes it when the BO is freed (herodrm.c, free_bo), and Panfrost's
  * import in air_metal.c asks herodrm for it directly.
  */
+#include <stddef.h>
 #include <stdint.h>
 
 struct herodrm_surface {
@@ -61,4 +62,37 @@ sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size)
 {
    (void)fd; (void)offset; (void)size;
    return herodrm_bo_sync(handle);
+}
+
+/* bgmtl.m's GPU state query (Bergamota's SWEET_GPU_SEL_INFO): only flags & 3 is read,
+ * bit 0 ready, bit 1 lost. HeroGPU has no "lost" state: a GPU it can open is ready. */
+struct bg_gpu_info {
+   uint32_t abi_version, flags, gpu_id, chip_id;
+   uint64_t va_start, va_size;
+   uint32_t last_fence, abi_minor;
+};
+int drmOpenWithType(const char *name, const char *busid, int type);
+int close(int fd);
+__attribute__((visibility("default"))) int sweet_drm_info(int fd, struct bg_gpu_info *out);
+__attribute__((visibility("default"))) void sweet_drm_take_wait_error(char *buf, size_t size);
+
+int
+sweet_drm_info(int fd, struct bg_gpu_info *out)
+{
+   (void)fd;
+   int gpu = drmOpenWithType("panfrost", NULL, 0);
+   if (gpu < 0)
+      return -1;
+   close(gpu);
+   *out = (struct bg_gpu_info){ .abi_version = 1, .flags = 1, .gpu_id = 0x6221 };
+   return 0;
+}
+
+/* The kernel's reason for the last failed fence wait: HeroGPU's submit is synchronous,
+ * so there is never a pending fence to fail on; nothing to report. */
+void
+sweet_drm_take_wait_error(char *buf, size_t size)
+{
+   if (size)
+      buf[0] = 0;
 }

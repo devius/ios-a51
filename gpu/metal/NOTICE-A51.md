@@ -16,6 +16,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 ## Changed files
 
 - tools/corpus.py
+- test/bgmtl_probe.m (T4 waits for completion: commit is asynchronous)
 - air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, IOSurfaces imported as descriptors, I/O left to Panfrost for its viewport transform, freedreno-only parts guarded)
 
 ## Added files

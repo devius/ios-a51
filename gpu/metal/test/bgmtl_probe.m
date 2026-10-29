@@ -257,6 +257,9 @@ main(int argc, char **argv)
                [enc dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                [enc endEncoding];
                [cb commit];
+               /* A51: commit is asynchronous since bgmtl.m completes command buffers off the encoding thread
+                * (rwa_flush + fence wait); Metal promises completion only after waitUntilCompleted. */
+               [cb waitUntilCompleted];
                if ([cb status] != 4) { printf("  round %u: status %ld\n", r, (long)[cb status]); break; }
                done++;
                for (unsigned i = 0; i < n; i++) if (fo[i] != fa[i] + 2.0f * fb[i]) total_bad++;

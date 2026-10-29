@@ -53,5 +53,20 @@ done
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/a51/a51_kernels.metal" -o "$OUT/a51_kernels.metallib"
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/bg_kernels.metal" -o "$OUT/bg_kernels.metallib"
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/bg_render.metal" -o "$OUT/bg_render.metallib"
+# Stage 3: Chlorophyll's MTLDevice (src/bgmtl.m) and its probes, as its build-probe.sh builds them (arm64, iOS 16)
+OBJC_IOS="$CC_IOS -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations"
+$OBJC_IOS -I "$HERE/air" -c "$HERE/src/bgmtl.m" -o "$OUT/bgmtl.o"
+MTL_LIBS="$OUT/bgmtl.o -L $OUT/lib -lairmetal $DRM -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,/private/var/a51gpu/lib"
+PROBES="bgmtl_probe bgmtl_render_probe bgmtl_quad_probe mtl_gap bgmtl_carenderer_probe"
+for p in $PROBES; do
+  $OBJC_IOS -I "$HERE/air" -c "$HERE/test/$p.m" -o "$OUT/$p.o"
+  extra=""; [ "$p" = bgmtl_carenderer_probe ] && extra="-framework QuartzCore -framework CoreGraphics"
+  $CC_IOS -o "$OUT/$p" "$OUT/$p.o" $MTL_LIBS $extra
+  rm -f "$OUT/$p.o"
+done
+$OBJC_IOS -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foundation
+rm -f "$OUT/bgmtl.o"
+xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/bg_quad.metal" -o "$OUT/bg_quad.metallib"
+for p in $PROBES mtl_introspect; do codesign -s - -f "$OUT/$p"; done
 for f in "$OUT/lib/libairmetal.dylib" "$OUT/a51_device_test" "$OUT/a51_surface_test" "$OUT/bgair_test" "$OUT/bgair_vertex_test" "$OUT/a51_render_diag"; do codesign -s - -f "$f"; done
 otool -L "$OUT/lib/libairmetal.dylib"
