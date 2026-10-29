@@ -61,6 +61,8 @@ static void
 diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca,
           unsigned prim, unsigned count);
 
+static int two_attachments;   /* case 6: colour 1 is the target, colour 0 must stay as cleared */
+
 static void
 diag(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca)
 {
@@ -80,6 +82,7 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
    memset(&shape, 0, sizeof(shape));
    shape.color_format[0] = 80; shape.color_count = 1; shape.sample_count = 1;
    for (int i = 0; i < 8; i++) shape.color_blend[i].write_mask = 0xf;
+   if (two_attachments) { shape.color_format[1] = 80; shape.color_count = 2; shape.color_blend[0].write_mask = 0; }
    shape.color_blend_count = 8;
    if (ca) {
       shape.vertex_attribute[0].format = 31; shape.vertex_attribute[0].offset = 0; shape.vertex_attribute[0].buffer_index = 0;
@@ -103,10 +106,11 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
    struct rwa_buffer_bind vt[4] = { { vbuf, 0 }, { NULL, 0 }, { mvp, 0 }, { tm, 0 } };
    struct rwa_vertex_stream streams[1] = { { vbuf, 0 } };
    float clear[4] = { 0.25f, 0.25f, 0.25f, 1 };
-   struct rwa_texture *colors[1] = { rt };
+   struct rwa_texture *rt1 = two_attachments ? rwa_texture_create(dev, &ts, why, sizeof(why)) : NULL;
+   struct rwa_texture *colors[2] = { rt, rt1 };
    struct rwa_draw dr;
    memset(&dr, 0, sizeof(dr));
-   dr.color = colors; dr.color_count = 1; dr.clear_color = clear;
+   dr.color = colors; dr.color_count = two_attachments ? 2 : 1; dr.clear_color = clear;
    dr.vertex = (struct rwa_bindings){ .buffers = vbufs, .buffer_count = ca ? 4 : 1 };
    dr.primitive = prim; dr.vertex_count = count;
    dr.vertex_streams = streams; dr.vertex_stream_count = info.vertex_streams;
@@ -121,6 +125,15 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
    const uint8_t *in = px + (48 * 64 + 16) * 4, *out = px + (16 * 64 + 48) * 4;
    printf("%-34s inside %3u,%3u,%3u,%3u  outside %3u,%3u,%3u,%3u  %4u pixels not clear (streams %u)\n", name,
           in[2], in[1], in[0], in[3], out[2], out[1], out[0], out[3], drawn, info.vertex_streams);
+   if (two_attachments) {
+      static uint8_t p1[64 * 64 * 4];
+      rwa_texture_read(rt1, 0, 0, o, sz, p1, 64 * 4, why, sizeof(why));
+      unsigned blue = 0;
+      for (int i = 0; i < 64 * 64; i++) blue += p1[i * 4] == 255 && p1[i * 4 + 2] == 0;
+      const uint8_t *in1 = p1 + (48 * 64 + 16) * 4;
+      printf("%-34s colour 1 inside %3u,%3u,%3u,%3u, %4u blue pixels (want ~2016); colour 0 must be all clear\n", "",
+             in1[2], in1[1], in1[0], in1[3], blue);
+   }
 }
 
 int
@@ -139,5 +152,9 @@ main(int argc, char **argv)
    diag("4 std_vert0_lpf + bg_fs_ca_color", qc, "std_vert0_lpf", bg, "bg_fs_ca_color", 1);
    /* 5: two 1-pixel lines, ~128 pixels expected (CoreAnimation draws mask coverage as lines) */
    diag_prim("5 line list cross, solid red", a51, "a51_vs_cross", a51, "a51_fs_red", 0, 1, 4);
+   two_attachments = 1;
+   diag("6 triangle into colour 1 only", a51, "a51_vs_tri", a51, "a51_fs_color1", 0);
+   diag("7 writes 0+1, colour 0 masked off", a51, "a51_vs_tri", a51, "a51_fs_color01", 0);
+   two_attachments = 0;
    return 0;
 }

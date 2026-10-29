@@ -448,9 +448,46 @@ lower_tex_unit_cb(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* A51: a texture or image instruction's dest_type (and an image store's src_type) sized from its value. The AIR frontend leaves it sizeless
+ * (nir_type_uint, nir_type_float); Bifrost's bi_emit_texc takes the register format from it and has
+ * none for a sizeless type (unreachable: an assertion in a debug build, undefined code in a release
+ * one -- QuartzCore's inplace_copy and tile_downsample, 41 functions of the iOS 16.7 corpus). */
+static bool
+size_tex_dest_type(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)b; (void)data;
+   if (instr->type == nir_instr_type_intrinsic) {
+      /* the same for image loads and stores (bi_emit_image_load, bi_emit_lea_image_to) */
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      const nir_intrinsic_info *info = &nir_intrinsic_infos[in->intrinsic];
+      if (!strstr(info->name, "image_"))
+         return false;
+      bool progress = false;
+      if (nir_intrinsic_has_dest_type(in) && info->has_dest &&
+          !nir_alu_type_get_type_size(nir_intrinsic_dest_type(in)) && nir_intrinsic_dest_type(in) != nir_type_invalid) {
+         nir_intrinsic_set_dest_type(in, (nir_alu_type)(nir_intrinsic_dest_type(in) | in->def.bit_size));
+         progress = true;
+      }
+      if (nir_intrinsic_has_src_type(in) && info->num_srcs > 3 &&
+          !nir_alu_type_get_type_size(nir_intrinsic_src_type(in)) && nir_intrinsic_src_type(in) != nir_type_invalid) {
+         nir_intrinsic_set_src_type(in, (nir_alu_type)(nir_intrinsic_src_type(in) | nir_src_bit_size(in->src[3])));
+         progress = true;
+      }
+      return progress;
+   }
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (nir_alu_type_get_type_size(tex->dest_type) || tex->dest_type == nir_type_invalid)
+      return false;
+   tex->dest_type = (nir_alu_type)(tex->dest_type | tex->def.bit_size);
+   return true;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 {
+   NIR_PASS(_, nir, nir_shader_instructions_pass, size_tex_dest_type, nir_metadata_all, NULL);
    if (!screen->caps.fs_position_is_sysval) {
       nir_shader_instructions_pass(nir, lower_tex_unit_cb, nir_metadata_all, NULL);
    }

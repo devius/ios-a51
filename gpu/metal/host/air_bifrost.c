@@ -23,6 +23,7 @@
 #include "compiler/air/nir_air.h"
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "pan_context.h"
 #include "pan_shader.h"
 #include "util/u_dynarray.h"
@@ -34,6 +35,39 @@
                                    struct util_dynarray *, struct pan_shader_info *);
 PAN_PER_ARCH(6)
 PAN_PER_ARCH(7)
+
+/* air_metal.c's size_tex_dest_type */
+static bool
+size_tex_dest_type(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)b; (void)data;
+   if (instr->type == nir_instr_type_intrinsic) {
+      /* the same for image loads and stores (bi_emit_image_load, bi_emit_lea_image_to) */
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      const nir_intrinsic_info *info = &nir_intrinsic_infos[in->intrinsic];
+      if (!strstr(info->name, "image_"))
+         return false;
+      bool progress = false;
+      if (nir_intrinsic_has_dest_type(in) && info->has_dest &&
+          !nir_alu_type_get_type_size(nir_intrinsic_dest_type(in)) && nir_intrinsic_dest_type(in) != nir_type_invalid) {
+         nir_intrinsic_set_dest_type(in, (nir_alu_type)(nir_intrinsic_dest_type(in) | in->def.bit_size));
+         progress = true;
+      }
+      if (nir_intrinsic_has_src_type(in) && info->num_srcs > 3 &&
+          !nir_alu_type_get_type_size(nir_intrinsic_src_type(in)) && nir_intrinsic_src_type(in) != nir_type_invalid) {
+         nir_intrinsic_set_src_type(in, (nir_alu_type)(nir_intrinsic_src_type(in) | nir_src_bit_size(in->src[3])));
+         progress = true;
+      }
+      return progress;
+   }
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (nir_alu_type_get_type_size(tex->dest_type) || tex->dest_type == nir_type_invalid)
+      return false;
+   tex->dest_type = (nir_alu_type)(tex->dest_type | tex->def.bit_size);
+   return true;
+}
 
 static void
 read_file(const char *path, void **data, size_t *size)
@@ -130,6 +164,7 @@ main(int argc, char **argv)
    }
 
    /* finalize_for_gallium (air_metal.c), for a screen with fs_position_is_sysval */
+   NIR_PASS(_, nir, nir_shader_instructions_pass, size_tex_dest_type, nir_metadata_all, NULL);
    NIR_PASS(_, nir, nir_lower_system_values);
    static const nir_lower_compute_system_values_options cs_options = { 0 };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &cs_options);

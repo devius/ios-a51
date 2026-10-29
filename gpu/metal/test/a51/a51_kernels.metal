@@ -54,3 +54,22 @@ kernel void texrows(texture2d<float, access::read> t [[texture(0)]], texture2d<f
     by_coord[gid.y * w + gid.x] = a.x | a.y << 8 | a.z << 16 | a.w << 24;
     by_sample[gid.y * w + gid.x] = b.x | b.y << 8 | b.z << 16 | b.w << 24;
 }
+
+// a51_render_diag.c case 6: a fragment stage that writes only the second colour attachment.
+struct A51Out1 { float4 c1 [[color(1)]]; };
+fragment A51Out1 a51_fs_color1()
+{
+    A51Out1 o;
+    o.c1 = float4(0.0, 0.0, 1.0, 1.0);
+    return o;
+}
+
+// a51_render_diag.c case 7: writes both attachments; colour 0's write mask is 0, so only colour 1 may change.
+struct A51Out01 { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; };
+fragment A51Out01 a51_fs_color01()
+{
+    A51Out01 o;
+    o.c0 = float4(1.0, 0.0, 0.0, 1.0);
+    o.c1 = float4(0.0, 0.0, 1.0, 1.0);
+    return o;
+}
