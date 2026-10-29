@@ -18,6 +18,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - tools/corpus.py
 - test/bgmtl_probe.m (T4 waits for completion: commit is asynchronous)
 - test/mtl_gap.m (-i lists base-class-only methods)
+- test/bgmtl_carenderer_probe.m (iOS 16: no MTLCopyAllDevices)
 - src/bgmtl.m (MTLHeap)
 - air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, IOSurfaces imported as descriptors, the IOSurface cache locked, I/O left to Panfrost for its viewport transform, freedreno-only parts guarded)
 

@@ -58,7 +58,19 @@ static struct rwa_device *dev;
 
 /* vlib/vfn, flib/ffn: the stages; ca: CoreAnimation's attribute layout */
 static void
+diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca,
+          unsigned prim, unsigned count);
+
+static void
 diag(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca)
+{
+   diag_prim(name, vlib, vfn, flib, ffn, ca, 3, 3);
+}
+
+/* prim: MTLPrimitiveType (1 lines, 3 triangles), count: vertices */
+static void
+diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca,
+          unsigned prim, unsigned count)
 {
    char why[512] = { 0 };
    size_t vs, fs;
@@ -96,7 +108,7 @@ diag(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib
    memset(&dr, 0, sizeof(dr));
    dr.color = colors; dr.color_count = 1; dr.clear_color = clear;
    dr.vertex = (struct rwa_bindings){ .buffers = vbufs, .buffer_count = ca ? 4 : 1 };
-   dr.primitive = 3; dr.vertex_count = 3;
+   dr.primitive = prim; dr.vertex_count = count;
    dr.vertex_streams = streams; dr.vertex_stream_count = info.vertex_streams;
    dr.vertex_buffer_table = vt; dr.vertex_buffer_table_count = ca ? 4 : 1;
    if (rwa_render_draw(r, &dr, why, sizeof(why)) != 0) { printf("%s: draw: %s\n", name, why); return; }
@@ -125,5 +137,7 @@ main(int argc, char **argv)
    diag("2 bg_vs (buffer) + bg_fs_color", bg, "bg_vs", bg, "bg_fs_color", 0);
    diag("3 std_vert0_lpf + solid red", qc, "std_vert0_lpf", a51, "a51_fs_red", 1);
    diag("4 std_vert0_lpf + bg_fs_ca_color", qc, "std_vert0_lpf", bg, "bg_fs_ca_color", 1);
+   /* 5: two 1-pixel lines, ~128 pixels expected (CoreAnimation draws mask coverage as lines) */
+   diag_prim("5 line list cross, solid red", a51, "a51_vs_cross", a51, "a51_fs_red", 0, 1, 4);
    return 0;
 }

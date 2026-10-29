@@ -149,8 +149,12 @@ main(int argc, char **argv)
       int only = argc > 2 ? atoi(argv[2]) : -1;
       NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
-      if (!all || !add) { printf("no Metal registration entry points\n"); return 2; }
-      printf("devices before: %lu\n", (unsigned long)[all() count]);
+      if (!add) { printf("no Metal registration entry points\n"); return 2; }
+      /* A51: iOS 16 does not export MTLCopyAllDevices (macOS API); MTLCreateSystemDefaultDevice runs the same
+       * MTLDeviceArrayInitialize, which MTLAddDevice asserts has happened (_deviceArray != NULL). */
+      if (all) printf("devices before: %lu\n", (unsigned long)[all() count]);
+      else printf("default device before: %p (MTLCopyAllDevices not exported)\n",
+                  ((id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice"))());
       if (getenv("BG_IMP_FIND")) {   // which ObjC methods live at these Metal.framework offsets (crash report frames)
          char *list = strdup(getenv("BG_IMP_FIND"));
          unsigned long want[16]; int nw = 0;

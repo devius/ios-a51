@@ -33,3 +33,10 @@ fragment float4 a51_fs_red()
 {
     return float4(1.0, 0.0, 0.0, 1.0);
 }
+
+// a51_render_diag.c case 5: a cross of two lines through the centre (line list, 4 vertices).
+vertex float4 a51_vs_cross(uint vid [[vertex_id]])
+{
+    const float2 p[4] = { float2(-1.0, 0.0), float2(1.0, 0.0), float2(0.0, -1.0), float2(0.0, 1.0) };
+    return float4(p[vid], 0.0, 1.0);
+}
