@@ -506,6 +506,16 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * every vertex the same texture coordinate (RWA_TEX_* below), and over a constant
     * flat and smooth are the same number.
     */
+#ifdef GALLIUM_PANFROST
+   /* A51: Panfrost lowers I/O itself (bifrost_preprocess_nir), and before that it turns
+    * gl_Position into screen space with nir_lower_viewport_transform -- a pass that only
+    * sees the position output as a variable store. Lowered here first, every vertex
+    * stage wrote clip coordinates where the Mali expects pixels and no triangle covered
+    * a pixel (boot 50, a51_render_diag: the clear drew, nothing else did).
+    */
+   if (strstr(screen->get_name(screen), "Panfrost"))
+      return;
+#endif
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
 }

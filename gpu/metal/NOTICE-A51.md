@@ -16,7 +16,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 ## Changed files
 
 - tools/corpus.py
-- air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, IOSurfaces imported as descriptors, freedreno-only parts guarded)
+- air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, IOSurfaces imported as descriptors, I/O left to Panfrost for its viewport transform, freedreno-only parts guarded)
 
 ## Added files
 
@@ -33,3 +33,4 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - test/a51/a51_device_test.c
 - test/a51/a51_kernels.metal
 - test/a51/a51_surface_test.c
+- test/a51/a51_render_diag.c

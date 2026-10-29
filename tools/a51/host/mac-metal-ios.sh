@@ -23,5 +23,5 @@ mkdir -p "$out"
 scp "${scp_opts[@]}" $mac:a51build/metal-ios.log "$out/build.log"
 [[ $rc == 0 ]] || { echo "build failed (log: $out/build.log)"; exit $rc; }
 scp "${scp_opts[@]}" -r $mac:'a51build/metal-ios-out/*' "$out/"
-(cd "$out" && sha256sum lib/*.dylib a51_device_test a51_surface_test bgair_test *.metallib > SHA256SUMS)
+(cd "$out" && sha256sum lib/*.dylib a51_device_test a51_surface_test bgair_test bgair_vertex_test a51_render_diag *.metallib > SHA256SUMS)
 ls -l "$out" "$out/lib"

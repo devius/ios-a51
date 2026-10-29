@@ -35,13 +35,6 @@
 PAN_PER_ARCH(6)
 PAN_PER_ARCH(7)
 
-/* air_metal.c's type_size_vec4 */
-static int
-type_size_vec4(const struct glsl_type *type, bool bindless)
-{
-   return glsl_count_attribute_slots(type, false);
-}
-
 static void
 read_file(const char *path, void **data, size_t *size)
 {
@@ -140,8 +133,8 @@ main(int argc, char **argv)
    NIR_PASS(_, nir, nir_lower_system_values);
    static const nir_lower_compute_system_values_options cs_options = { 0 };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &cs_options);
-   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* ... except nir_lower_io, which a Panfrost screen leaves to bifrost_preprocess_nir
+    * (after its viewport transform), as air_metal.c does on the phone. */
 
    /* panfrost_create_shader_state */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&

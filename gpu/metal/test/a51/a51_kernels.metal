@@ -21,3 +21,15 @@ kernel void paint(texture2d<float, access::write> t [[texture(0)]], uint2 gid [[
     if (gid.x < t.get_width() && gid.y < t.get_height())
         t.write(float4(0.0, float(gid.y) / 255.0, float(gid.x) / 255.0, 1.0), gid);
 }
+
+// a51_render_diag.c: a fixed lower-left triangle, and a solid red fragment.
+vertex float4 a51_vs_tri(uint vid [[vertex_id]])
+{
+    const float2 p[3] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0) };
+    return float4(p[vid], 0.0, 1.0);
+}
+
+fragment float4 a51_fs_red()
+{
+    return float4(1.0, 0.0, 0.0, 1.0);
+}

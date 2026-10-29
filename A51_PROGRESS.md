@@ -945,3 +945,42 @@ committed state, `CROSS=aarch64-linux-gnu- EXTRA_CFLAGS="-DDEADMAN_MS=3600000UL
 -DDEADMAN_MPIDR=0x103UL"`. A 15-minute twin differs in 5 bytes (the deadline
 immediate). Panics now reset into TWRP themselves (0143), so the dead-man only
 guards hard hangs, and UI sessions get an hour.
+
+## Speed-ups and reboot from iOS (2026-10-29, boots 46-50)
+
+- Patch 0150: the system clock from the PMIC's RTC (boot 46: the right date
+  instead of 1969). Idle load at 5 minutes went from 20 (boot 45) to 13.7.
+- Boot 46 idle: ReportCrash at 216% CPU, working through crash loops of daemons
+  whose hardware is missing. `tools/a51/sweet-launchd-disable.py` removed
+  ReportCrash, locationd, WirelessRadioManagerd and VisualVoicemail's vmd from
+  launchd.plist (original kept, `--restore`): idle load 21 -> 3.1.
+- Patches 0151 (key store answers aks wrap/unwrap: securityd's retry loop) and
+  0152 (UI and realtime threads prefer the A73s, `sweetfast=0x70`), from the S7
+  port. Home-screen swipes stayed at 2-5 fps (median 3): the CPU renderer's
+  ~250 ms a frame is the limit, so the GPU has to draw (Metal, below).
+- Patch 0153: `reboot` from iOS. A normal reboot is Samsung's sec_reboot:
+  INFORM3 = 0x12345670, INFORM2 magic byte 0x4e, PMU SWRESET (INFORM3 = 0 is
+  "emergency" and goes to TWRP, boot 49). `sysctl kern.a51_reboot_recovery=1`
+  first reboots into TWRP. Boot 50 (kernel155): both verified; the corner
+  gesture is now only a fallback.
+
+## GPU sub-project 4: Metal on the Mali, stages 1-2 (2026-10-29)
+
+Spec/plan: `docs/superpowers/specs/2026-10-29-a51-gpu-metal-design.md`,
+`docs/superpowers/plans/2026-10-29-a51-gpu-metal.md`. Chlorophyll (MIT, Metal
+AIR -> NIR -> Gallium; written against iOS 16.5) vendored as `gpu/metal/`,
+its Adreno back end replaced with Panfrost over HeroGPU.
+
+- Stage 1 (PC, `tools/a51/host/mac-metal-host.sh`): iOS 16.7's QuartzCore
+  shaders through the Bifrost compiler: 132 of 141 (`gpu/metal/results/
+  ios16.7-bifrost.md`; 4 tile shaders CA does not request here, 2 frontend
+  cases, 2 compiler bugs: divergence analysis lacks
+  `load_converted_output_pan`, CLPER packing on v6).
+- Stage 2 (phone, `tools/a51/host/mac-metal-ios.sh`, `/private/var/a51gpu/metal`):
+  `libairmetal.dylib` on the Mali-G72. a51_device_test 7/7 (two devices, a GPU
+  fault reported as an error), Chlorophyll's bgair_test 3/3 kernels exact,
+  a51_surface_test 6/6 (a kernel writes IOSurfaces, padded rows kept),
+  bgair_vertex_test 3664/3664 pixels with QuartzCore's own `std_vert0_lpf`.
+  The bug that made every draw empty: air_metal.c lowered I/O before Panfrost,
+  so `nir_lower_viewport_transform` (Bifrost does the viewport in the vertex
+  shader) never saw gl_Position; Panfrost now lowers I/O itself.
