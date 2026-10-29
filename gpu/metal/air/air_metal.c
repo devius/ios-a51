@@ -267,6 +267,9 @@ struct rwa_sbo {
    uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
 };
 extern int sweet_drm_surface_bo(int fd, struct rwa_sbo *io);
+/* A51 (gpu/metal/a51/sweet_drm_hero.c): the same, returning the descriptor that stands for
+ * the surface's BO -- what Panfrost imports (it takes dma-bufs, not GEM handles) -- or -1. */
+extern int sweet_drm_surface_bo_prime(struct rwa_sbo *io);
 extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
@@ -1679,7 +1682,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        * BO. IOSurface IDs come from an increasing counter; the size and pixel format are part of the key besides. */
       enum { SBO_CACHE = 24 };   /* each entry pins its surface's memory: 128 screen-sized ones exhausted what the GPU maps (full-screen allocations refused, no backdrop for blur) */
       static struct { struct rwa_device *dev; int id; unsigned w, h; enum pipe_format f; struct rwa_sbo sb; struct pipe_resource *res;
-                      uint64_t used; } sbo_cache[SBO_CACHE];
+                      uint64_t used; int prime; } sbo_cache[SBO_CACHE];
       static uint64_t sbo_clock;
       int sbo_slot = -1, sbo_victim = 0;
       for (int k = 0; k < SBO_CACHE; k++) {
@@ -1687,12 +1690,18 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
              sbo_cache[k].h == height && sbo_cache[k].f == fmt->pipe) { sbo_slot = k; break; }
          if (!sbo_cache[k].res || sbo_cache[k].used < sbo_cache[sbo_victim].used) sbo_victim = k;
       }
-      int sr = 0;
+      int sr = 0, prime = -1;
       if (sbo_slot >= 0) {
          sb = sbo_cache[sbo_slot].sb;
+         prime = sbo_cache[sbo_slot].prime;
          sbo_cache[sbo_slot].used = ++sbo_clock;
       } else {
+#ifdef GALLIUM_PANFROST
+         prime = sweet_drm_surface_bo_prime(&sb);
+         sr = prime < 0 ? -1 : 0;
+#else
          sr = sweet_drm_surface_bo(-1, &sb);
+#endif
       }
       if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) {
          say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
@@ -1706,8 +1715,13 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          return NULL;
       }
       struct winsys_handle whandle = {
+#ifdef GALLIUM_PANFROST
+         .type = WINSYS_HANDLE_TYPE_FD,    /* A51: herodrm's stand-in descriptor for the BO */
+         .handle = (unsigned)prime,
+#else
          .type = WINSYS_HANDLE_TYPE_KMS,
          .handle = sb.handle,
+#endif
          .stride = sb.bytes_per_row,
          .offset = sb.offset,
          .size = sb.size,
@@ -1773,6 +1787,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          pipe_resource_reference(&sbo_cache[sbo_victim].res, NULL);  /* evict the least recently used entry */
          sbo_cache[sbo_victim].dev = device; sbo_cache[sbo_victim].id = import->id; sbo_cache[sbo_victim].w = width;
          sbo_cache[sbo_victim].h = height; sbo_cache[sbo_victim].f = fmt->pipe; sbo_cache[sbo_victim].sb = sb;
+         sbo_cache[sbo_victim].prime = prime;
          sbo_cache[sbo_victim].used = ++sbo_clock;
          pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
       }

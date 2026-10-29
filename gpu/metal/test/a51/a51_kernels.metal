@@ -14,3 +14,10 @@ kernel void poke(device uint *out [[buffer(0)]], constant uint &far [[buffer(1)]
 {
     out[far] = 1u;
 }
+
+// a51_surface_test.c: pixel (x, y) of a BGRA8Unorm texture gets bytes x, y, 0, 255.
+kernel void paint(texture2d<float, access::write> t [[texture(0)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < t.get_width() && gid.y < t.get_height())
+        t.write(float4(0.0, float(gid.y) / 255.0, float(gid.x) / 255.0, 1.0), gid);
+}

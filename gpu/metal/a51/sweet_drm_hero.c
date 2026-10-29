@@ -26,12 +26,13 @@ struct rwa_sbo {
 };
 
 int sweet_drm_surface_bo(int fd, struct rwa_sbo *io);
+int sweet_drm_surface_bo_prime(struct rwa_sbo *io);
 int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
 
+/* The descriptor standing for the BO, or -1. */
 int
-sweet_drm_surface_bo(int fd, struct rwa_sbo *io)
+sweet_drm_surface_bo_prime(struct rwa_sbo *io)
 {
-   (void)fd;
    struct herodrm_surface s;
    int prime = herodrm_surface_import(io->surface_id, &s);
    if (prime < 0)
@@ -45,7 +46,14 @@ sweet_drm_surface_bo(int fd, struct rwa_sbo *io)
    io->height = s.height;
    io->pixel_format = s.pixel_format;
    io->planes = s.planes;
-   return 0;
+   return prime;
+}
+
+int
+sweet_drm_surface_bo(int fd, struct rwa_sbo *io)
+{
+   (void)fd;
+   return sweet_drm_surface_bo_prime(io) < 0 ? -1 : 0;
 }
 
 int
