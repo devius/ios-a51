@@ -15,6 +15,15 @@ mesa = Path(sys.argv[1])
 here = Path(__file__).resolve().parent
 
 
+def edit_all(rel, count, old, new):
+    """edit() for text that occurs exactly `count` times (all of them are replaced)."""
+    path = mesa / rel
+    text = path.read_text()
+    assert text.count(old) == count, f'{rel}: expected text found {text.count(old)} times, not {count}:\n{old}'
+    path.write_text(text.replace(old, new))
+    print('patched', rel, f'({count} places)')
+
+
 def edit(rel, old, new):
     path = mesa / rel
     text = path.read_text()
@@ -124,6 +133,24 @@ edit('src/compiler/nir/nir_divergence_analysis.c',
      "      is_divergent = true;\n"
      "      break;\n"
      "   case nir_intrinsic_load_output:\n      is_divergent = src_divergent(instr->src[0], state);\n")
+
+# Panfrost preloads a colour attachment into the tile buffer only when it was
+# drawn (blend enabled) and holds data, or when batch->read says so -- and it
+# sets batch->read for depth/stencil only. A fragment shader that reads an
+# attachment by framebuffer fetch without writing it (write mask 0: Metal's
+# programmable blending, CoreAnimation's mask and rounded-clip coverage pass)
+# then read an empty tile: zeros (gpu/metal a51_render_diag case 14). Mark the
+# attachments the bound fragment shader reads, at each draw.
+edit_all('src/gallium/drivers/panfrost/pan_cmdstream.c', 2,
+     "   panfrost_update_shader_state(batch, PIPE_SHADER_FRAGMENT);\n   panfrost_clean_state_3d(ctx);\n",
+     "   panfrost_update_shader_state(batch, PIPE_SHADER_FRAGMENT);\n"
+     "   if (ctx->prog[PIPE_SHADER_FRAGMENT] && !getenv(\"A51_NO_FBREAD_PRELOAD\")) {\n"
+     "      u_foreach_bit(i, ctx->prog[PIPE_SHADER_FRAGMENT]->info.fs.outputs_read) {\n"
+     "         if (i < batch->key.nr_cbufs && batch->key.cbufs[i])\n"
+     "            batch->read |= PIPE_CLEAR_COLOR0 << i;\n"
+     "      }\n"
+     "   }\n"
+     "   panfrost_clean_state_3d(ctx);\n")
 
 osmesa_c.write_text(osmesa_c.read_text() + '\n' + (here / 'osmesa_hero.inc').read_text())
 print('appended osmesa_hero.inc')

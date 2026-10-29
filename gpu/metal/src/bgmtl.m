@@ -832,8 +832,13 @@ bg_air_slice(NSData *d)
    if (bg_trace() && getenv("BGMTL_DUMP")) {   // the exact modules this pipeline is built from, for air2nir on the Mac
       mkdir(getenv("BGMTL_DUMP"), 0755);
       NSString *d = [NSString stringWithUTF8String:getenv("BGMTL_DUMP")];
-      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%@.v.bc", [vertex name]] atomically:NO];
-      [fair writeToFile:[d stringByAppendingFormat:@"/%@.f.bc", [fragment name]] atomically:NO];
+      /* A51: numbered, so the specialisations of one function (CoreAnimation's fixed_frag_* with different
+       * function constants) do not overwrite each other; the number matches the trace's pipeline order. */
+      static int seq;
+      int n = __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED);
+      BG_LOG("dump %03d: %s + %s\n", n, [[vertex name] UTF8String], [[fragment name] UTF8String]);
+      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%03d-%@.v.bc", n, [vertex name]] atomically:NO];
+      [fair writeToFile:[d stringByAppendingFormat:@"/%03d-%@.f.bc", n, [fragment name]] atomically:NO];
    }
    struct rwa_render_shape shape;
    memset(&shape, 0, sizeof(shape));
@@ -1253,6 +1258,34 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           * the poster editor) and counted towards the watchdog that switches Metal off. */
          if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
             BG_LOG("draw skipped: %s\n", why);
+         /* A51 debugging: BGMTL_DRAWPROBE="x,y" (with the trace) logs each attachment's texel at (x,y) after every draw, so a
+          * multi-pass effect (CoreAnimation's masks and rounded clips) shows which draw goes wrong. */
+         if (bg_trace() && getenv("BGMTL_DRAWPROBE")) {
+            unsigned px = 0, py = 0;
+            sscanf(getenv("BGMTL_DRAWPROBE"), "%u,%u", &px, &py);
+            char fw[256] = { 0 };
+            rwa_finish([dev rwa], fw, sizeof(fw));
+            static unsigned dseq;
+            char line[256]; size_t n = 0;
+            for (unsigned i = 0; i < w->color_count && n < sizeof(line); i++) {
+               uint8_t c[4] = { 0 };
+               if (colors[i] && px < [(BGMTLTexture *)w->color[i] width] && py < [(BGMTLTexture *)w->color[i] height]) {
+                  const unsigned o[3] = { px, py, 0 }, one[3] = { 1, 1, 1 };
+                  rwa_texture_read(colors[i], 0, 0, o, one, c, 4, fw, sizeof(fw));
+               }
+               n += snprintf(line + n, sizeof(line) - n, "  c%u=(%u,%u,%u,%u)", i, c[0], c[1], c[2], c[3]);
+            }
+            BG_LOG("drawprobe %u %s prim %lu count %lu:%s\n", dseq++, rp->_names, (unsigned long)w->primitive,
+                   (unsigned long)w->vcount_verts, line);
+            for (unsigned i = 0; i < w->count; i++) {   // the fragment buffers as the GPU read them
+               if (!w->buffers[i]) continue;
+               const uint8_t *p = (const uint8_t *)[(BGMTLBuffer *)w->buffers[i] contents] + w->offsets[i];
+               const float *f = (const float *)p;
+               const __fp16 *h = (const __fp16 *)p;
+               BG_LOG("   exec fbuf[%u]: f %g %g %g %g | %g %g %g %g  h %g %g %g %g %g %g %g %g\n", i, f[0], f[1], f[2], f[3], f[4],
+                      f[5], f[6], f[7], (float)h[0], (float)h[1], (float)h[2], (float)h[3], (float)h[4], (float)h[5], (float)h[6], (float)h[7]);
+            }
+         }
          // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
          // later draw of the pass touches it
          if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
@@ -2036,6 +2069,16 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", i,
                 (unsigned long)[(BGMTLBuffer *)_vbuf[i] length], (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5],
                 f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+      }
+      // A51: the fragment stage's buffers too, as floats and as halfs (CoreAnimation's lph shaders read half uniforms)
+      for (unsigned i = 0; i < _fhigh; i++) {
+         if (!_fbuf[i]) continue;
+         const uint8_t *p = (const uint8_t *)[(BGMTLBuffer *)_fbuf[i] contents] + _foff[i];
+         const float *f = (const float *)p;
+         const __fp16 *h = (const __fp16 *)p;
+         BG_LOG("  fbuf[%u] off %lu: f %g %g %g %g | %g %g %g %g  h %g %g %g %g %g %g %g %g\n", i, (unsigned long)_foff[i],
+                f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], (float)h[0], (float)h[1], (float)h[2], (float)h[3],
+                (float)h[4], (float)h[5], (float)h[6], (float)h[7]);
       }
    }
    BGWork *w = [[[BGWork alloc] init] autorelease];

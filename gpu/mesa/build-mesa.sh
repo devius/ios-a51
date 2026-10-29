@@ -76,8 +76,9 @@ endian = 'little'
 EOF
 
 cd mesa
+[ -d build ] && [ "$(cat build/.a51-buildtype 2>/dev/null)" != "${MESA_BUILDTYPE:-release}" ] && rm -rf build
 [ -d build ] || meson setup build --cross-file ../ios-cross.txt \
-  --buildtype=release -Dprefix=/ \
+  --buildtype=${MESA_BUILDTYPE:-release} -Dprefix=/ \
   -Dgallium-drivers=softpipe,panfrost -Dvulkan-drivers= \
   -Dllvm=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= \
   -Dosmesa=true -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dshared-glapi=enabled \
@@ -85,6 +86,7 @@ cd mesa
   -Dxmlconfig=disabled -Dbuild-tests=false -Dglvnd=disabled -Dlmsensors=disabled \
   -Dgallium-opencl=disabled -Dgallium-rusticl=false -Dgallium-xa=disabled \
   -Dgallium-vdpau=disabled -Dgallium-va=disabled -Dtools= -Dperfetto=false
+echo "${MESA_BUILDTYPE:-release}" > build/.a51-buildtype
 ninja -C build -k 0
 cd ..
 

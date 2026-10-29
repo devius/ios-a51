@@ -20,7 +20,7 @@ scp "${scp_opts[@]}" "$repo"/gpu/mesa/* $mac:a51build/mesa-src/
 scp "${scp_opts[@]}" -r "$repo/gpu/eagl" $mac:a51build/eagl-src
 echo "building Mesa on the VM, started $(date +%T)"
 set +e
-ssh "${ssh_opts[@]}" $mac 'export PATH=$HOME/mesa-venv/bin:/usr/local/bin:$PATH; cd ~/a51build &&
+ssh "${ssh_opts[@]}" $mac "export MESA_BUILDTYPE=${MESA_BUILDTYPE:-release}"'; export PATH=$HOME/mesa-venv/bin:/usr/local/bin:$PATH; cd ~/a51build &&
 	bash mesa-src/build-mesa.sh ~/a51build/mesa-work ~/a51build/mesa-out > mesa-build.log 2>&1 &&
 	MESA_INC=$HOME/a51build/mesa-work/mesa/include bash eagl-src/build-eagl.sh ~/a51build/mesa-out >> mesa-build.log 2>&1; rc=$?;
 	echo "build-mesa.sh exit=$rc at $(date +%T)";

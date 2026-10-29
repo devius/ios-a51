@@ -73,3 +73,55 @@ fragment A51Out01 a51_fs_color01()
     o.c1 = float4(0.0, 0.0, 1.0, 1.0);
     return o;
 }
+
+// a51_render_diag.c case 8: CoreAnimation's coverage pass shape: reads colour 0 (framebuffer fetch), writes
+// only colour 1, colour 0 masked off. Colour 1 must get colour 0's clear value, swapped to blue-red-green.
+fragment A51Out1 a51_fs_fetch0_to1(float4 c0 [[color(0)]])
+{
+    A51Out1 o;
+    o.c1 = float4(c0.b, 1.0, c0.g, 1.0);
+    return o;
+}
+
+// a51_render_diag.c cases 9 and 10: CoreAnimation's composite shape: read colour 0 (and 1) by framebuffer fetch
+// and write colour 0 -- as half (9, CA's f16vec4 outputs) and as float (10). Colour 0 inside the triangle
+// must become (clear.b, 1, clear.g).
+struct A51OutH0 { half4 c0 [[color(0)]]; };
+fragment A51OutH0 a51_fs_fetch0_half(half4 c0 [[color(0)]], float4 c1 [[color(1)]])
+{
+    A51OutH0 o;
+    o.c0 = half4(c0.b, 1.0h, c0.g, 1.0h + half(c1.a) * 0.0h);
+    return o;
+}
+struct A51OutF0 { float4 c0 [[color(0)]]; };
+fragment A51OutF0 a51_fs_fetch0_float(float4 c0 [[color(0)]], float4 c1 [[color(1)]])
+{
+    A51OutF0 o;
+    o.c0 = float4(c0.b, 1.0, c0.g, 1.0 + c1.a * 0.0);
+    return o;
+}
+
+// a51_render_diag.c case 11: the composite's other half: read colour 1 (not written), write colour 0.
+fragment A51OutH0 a51_fs_fetch1_to0(half4 c0 [[color(0)]], half4 c1 [[color(1)]])
+{
+    A51OutH0 o;
+    o.c0 = half4(c1.b, c0.a, c1.g, 1.0h);
+    return o;
+}
+
+// a51_render_diag.c case 12: screen-space derivatives (CoreAnimation's anti-aliased corners use fwidth).
+// d(position.x)/dx = 1 and d(position.y)/dy = 1: red = 0.5 * dfdx(x) -> 128, green = 0.25 * dfdy(y) -> 64,
+// blue = 0.125 * fwidth(x + y) -> 0.125 * 2 -> 64.
+fragment float4 a51_fs_derivs(float4 p [[position]])
+{
+    return float4(0.5 * dfdx(p.x), 0.25 * dfdy(p.y), 0.125 * fwidth(p.x + p.y), 1.0);
+}
+
+// a51_render_diag.c case 13: case 8 with CoreAnimation's types: half4 in, half4 out to colour 1.
+struct A51OutH1 { half4 c1 [[color(1)]]; };
+fragment A51OutH1 a51_fs_fetch0_to1_half(half4 c0 [[color(0)]])
+{
+    A51OutH1 o;
+    o.c1 = half4(c0.b, 1.0h, c0.g, 1.0h);
+    return o;
+}

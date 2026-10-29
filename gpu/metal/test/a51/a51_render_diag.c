@@ -62,6 +62,7 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
           unsigned prim, unsigned count);
 
 static int two_attachments;   /* case 6: colour 1 is the target, colour 0 must stay as cleared */
+static int no_clear;          /* case 14: colour 0 holds pixels written by the CPU, the pass loads instead of clearing */
 
 static void
 diag(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t *flib, const char *ffn, int ca)
@@ -82,7 +83,7 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
    memset(&shape, 0, sizeof(shape));
    shape.color_format[0] = 80; shape.color_count = 1; shape.sample_count = 1;
    for (int i = 0; i < 8; i++) shape.color_blend[i].write_mask = 0xf;
-   if (two_attachments) { shape.color_format[1] = 80; shape.color_count = 2; shape.color_blend[0].write_mask = 0; }
+   if (two_attachments) { shape.color_format[1] = 80; shape.color_count = 2; shape.color_blend[0].write_mask = two_attachments == 2 ? 0xf : 0; }
    shape.color_blend_count = 8;
    if (ca) {
       shape.vertex_attribute[0].format = 31; shape.vertex_attribute[0].offset = 0; shape.vertex_attribute[0].buffer_index = 0;
@@ -110,7 +111,15 @@ diag_prim(const char *name, const uint8_t *vlib, const char *vfn, const uint8_t 
    struct rwa_texture *colors[2] = { rt, rt1 };
    struct rwa_draw dr;
    memset(&dr, 0, sizeof(dr));
-   dr.color = colors; dr.color_count = two_attachments ? 2 : 1; dr.clear_color = clear;
+   dr.color = colors; dr.color_count = two_attachments ? 2 : 1; dr.clear_color = no_clear ? NULL : clear;
+   if (no_clear) {   /* colour 0 = the clear colour, written by the CPU; colour 1 = zero */
+      static uint8_t img[64 * 64 * 4];
+      unsigned o0[3] = { 0, 0, 0 }, s0[3] = { 64, 64, 1 };
+      for (int i = 0; i < 64 * 64; i++) { img[i * 4] = img[i * 4 + 1] = img[i * 4 + 2] = 64; img[i * 4 + 3] = 255; }
+      rwa_texture_write(rt, 0, 0, o0, s0, img, 64 * 4, why, sizeof(why));
+      memset(img, 0, sizeof(img));
+      if (rt1) rwa_texture_write(rt1, 0, 0, o0, s0, img, 64 * 4, why, sizeof(why));
+   }
    dr.vertex = (struct rwa_bindings){ .buffers = vbufs, .buffer_count = ca ? 4 : 1 };
    dr.primitive = prim; dr.vertex_count = count;
    dr.vertex_streams = streams; dr.vertex_stream_count = info.vertex_streams;
@@ -155,6 +164,23 @@ main(int argc, char **argv)
    two_attachments = 1;
    diag("6 triangle into colour 1 only", a51, "a51_vs_tri", a51, "a51_fs_color1", 0);
    diag("7 writes 0+1, colour 0 masked off", a51, "a51_vs_tri", a51, "a51_fs_color01", 0);
+   /* 8: colour 1 must be (64, 255, 64) inside the triangle: colour 0's clear read back */
+   diag("8 fetch colour 0 -> colour 1", a51, "a51_vs_tri", a51, "a51_fs_fetch0_to1", 0);
+   diag("13 as 8, half in and out", a51, "a51_vs_tri", a51, "a51_fs_fetch0_to1_half", 0);
+   /* 9, 10: colour 0 (written, mask on) must be (64, 255, 64) inside: its own clear value read back */
+   two_attachments = 2;
+   diag("9 fetch 0+1 -> colour 0 as half", a51, "a51_vs_tri", a51, "a51_fs_fetch0_half", 0);
+   diag("10 fetch 0+1 -> colour 0 as float", a51, "a51_vs_tri", a51, "a51_fs_fetch0_float", 0);
+   /* 11: colour 0 must be (64, 255, 64) inside: colour 1's clear value and colour 0's alpha read back */
+   diag("11 fetch colour 1 -> colour 0", a51, "a51_vs_tri", a51, "a51_fs_fetch1_to0", 0);
+   two_attachments = 0;
+   /* 14: case 8 without a clear: colour 0's pixels come from memory (CoreAnimation's coverage pass); colour 1
+    * must again be (64, 255, 64) inside -- Panfrost must preload an attachment the shader only reads */
+   two_attachments = 1; no_clear = 1;
+   diag("14 as 8, colour 0 loaded, not cleared", a51, "a51_vs_tri", a51, "a51_fs_fetch0_to1", 0);
+   two_attachments = 0; no_clear = 0;
+   /* 12: inside must be (128, 64, 64): derivatives of the pixel position */
+   diag("12 derivatives dfdx/dfdy/fwidth", a51, "a51_vs_tri", a51, "a51_fs_derivs", 0);
    two_attachments = 0;
    return 0;
 }

@@ -550,8 +550,13 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * stage wrote clip coordinates where the Mali expects pixels and no triangle covered
     * a pixel (boot 50, a51_render_diag: the clear drew, nothing else did).
     */
-   if (strstr(screen->get_name(screen), "Panfrost"))
+   if (strstr(screen->get_name(screen), "Panfrost")) {
+      /* Panfrost pushes UBO 0's constant-offset reads into registers and asserts UBO 0 is GL's
+       * default uniform block (panfrost_shader_compile). For a Metal stage UBO 0 is buffer 0, a
+       * Metal buffer -- CPU-visible here and read at commit, so pushing it is right; say so. */
+      nir->info.first_ubo_is_default_ubo = true;
       return;
+   }
 #endif
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
