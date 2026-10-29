@@ -4512,6 +4512,14 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
    return rc;
 }
 
+/* A51: bytes a texel of an MTLPixelFormat (bgmtl.m's newTextureWithBytesNoCopy: has no row pitch to go by), 0 if unknown. */
+unsigned
+rwa_pixel_format_bytes(unsigned mtl)
+{
+   const struct rwa_pixel_format *fmt = pixel_format(mtl);
+   return fmt ? util_format_get_blocksize(fmt->pipe) : 0;
+}
+
 int
 rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 {

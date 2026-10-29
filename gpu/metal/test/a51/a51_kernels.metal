@@ -40,3 +40,17 @@ vertex float4 a51_vs_cross(uint vid [[vertex_id]])
     const float2 p[4] = { float2(-1.0, 0.0), float2(1.0, 0.0), float2(0.0, -1.0), float2(0.0, 1.0) };
     return float4(p[vid], 0.0, 1.0);
 }
+
+// a51_texrows_probe.m: texel (x, y) of t by coordinate and by normalized sampling, packed RGBA8.
+kernel void texrows(texture2d<float, access::read> t [[texture(0)]], texture2d<float> ts [[texture(1)]],
+                    sampler s [[sampler(0)]], device uint *by_coord [[buffer(0)]], device uint *by_sample [[buffer(1)]],
+                    uint2 gid [[thread_position_in_grid]])
+{
+    uint w = t.get_width(), h = t.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float4 c = t.read(gid);
+    float4 d = ts.sample(s, (float2(gid) + 0.5) / float2(w, h));
+    uint4 a = uint4(round(saturate(c) * 255.0)), b = uint4(round(saturate(d) * 255.0));
+    by_coord[gid.y * w + gid.x] = a.x | a.y << 8 | a.z << 16 | a.w << 24;
+    by_sample[gid.y * w + gid.x] = b.x | b.y << 8 | b.z << 16 | b.w << 24;
+}

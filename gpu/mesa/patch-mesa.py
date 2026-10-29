@@ -107,6 +107,24 @@ edit('src/gallium/frontends/osmesa/osmesa.c',
 
 # The OSMesaSweet* entry points the EAGL shim uses (GPU blit into IOSurfaces).
 osmesa_c = mesa / 'src/gallium/frontends/osmesa/osmesa.c'
+# Divergence analysis does not know two intrinsics Bifrost's framebuffer-fetch
+# lowering (bi_lower_load_output) emits; an unknown one is unreachable(), so a
+# release build compiled any shader that reads the framebuffer into undefined
+# code (CoreAnimation's masks read their coverage that way: the mask came out
+# empty), and a debug build asserted (gpu/metal results, inplace_copy_lpf).
+# The converted value is per pixel, as load_output is in a fragment shader;
+# the conversion descriptor is the same for the whole draw.
+edit('src/compiler/nir/nir_divergence_analysis.c',
+     "   case nir_intrinsic_load_sample_positions_pan:\n",
+     "   case nir_intrinsic_load_sample_positions_pan:\n"
+     "   case nir_intrinsic_load_rt_conversion_pan:\n")
+edit('src/compiler/nir/nir_divergence_analysis.c',
+     "   case nir_intrinsic_load_output:\n      is_divergent = src_divergent(instr->src[0], state);\n",
+     "   case nir_intrinsic_load_converted_output_pan:\n"
+     "      is_divergent = true;\n"
+     "      break;\n"
+     "   case nir_intrinsic_load_output:\n      is_divergent = src_divergent(instr->src[0], state);\n")
+
 osmesa_c.write_text(osmesa_c.read_text() + '\n' + (here / 'osmesa_hero.inc').read_text())
 print('appended osmesa_hero.inc')
 

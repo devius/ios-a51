@@ -20,4 +20,12 @@ check vertex_compiles        0 'function=quad_vertex stage=vertex bytes=[1-9]'  
 check fragment_compiles      0 'function=quad_fragment stage=fragment bytes=[1-9]'   quad_fragment
 check reports_function_constants 0 'function=quad_fragment_fc .*constants=1'          quad_fragment_fc
 check unknown_function       1 'no function'                                          no_such_function
+# iOS's own shaders, when a copy of QuartzCore's default.metallib is given (never in git):
+# inplace_copy_lpf reads the framebuffer (load_converted_output_pan on Bifrost).
+if [ -n "${QC_METALLIB:-}" ] && [ -f "$QC_METALLIB" ]; then
+  LIB="$QC_METALLIB"
+  check framebuffer_fetch_compiles 0 'function=inplace_copy_lpf stage=fragment bytes=[1-9]' inplace_copy_lpf
+else
+  echo "SKIP framebuffer_fetch_compiles (QC_METALLIB not set)"
+fi
 exit $fail

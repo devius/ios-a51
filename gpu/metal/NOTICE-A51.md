@@ -19,7 +19,8 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - test/bgmtl_probe.m (T4 waits for completion: commit is asynchronous)
 - test/mtl_gap.m (-i lists base-class-only methods)
 - test/bgmtl_carenderer_probe.m (iOS 16: no MTLCopyAllDevices)
-- src/bgmtl.m (MTLHeap)
+- src/bgmtl.m (MTLHeap, device limits, no-copy texture row pitch)
+- air/air_metal.h (rwa_pixel_format_bytes)
 - air/air_metal.c (Panfrost device over HeroGPU, GPU faults reported, IOSurfaces imported as descriptors, the IOSurface cache locked, I/O left to Panfrost for its viewport transform, freedreno-only parts guarded)
 
 ## Added files
@@ -27,7 +28,7 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - check-vendor.sh
 - build-host.sh
 - host/air_bifrost.c
-- test/host/test_air_bifrost.sh
+- test/host/test_air_bifrost.sh (framebuffer-fetch case with QC_METALLIB)
 - test/host/fixtures/quad.metal
 - test/host/fixtures/quad.metallib
 - tools/test_corpus.py
@@ -43,3 +44,4 @@ patches (`air-ir3`, `ir3-*`, `fd*`), `build-host.sh`, `build-ios.sh`,
 - test/host/check_herodrm_protos.sh
 - test/a51/a51_heap_probe.m
 - test/a51/a51_device_limits.m
+- test/a51/a51_texrows_probe.m

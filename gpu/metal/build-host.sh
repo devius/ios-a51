@@ -13,6 +13,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${1:?usage: $0 WORK MESA_CHECKOUT LIBDRM_CHECKOUT}"; MESA="${2:?}"; LIBDRM="${3:?}"
 mkdir -p "$WORK/pc"
 cd "$WORK"
+# a fresh tree whenever a patch input changed, so patch-mesa.py's edits always apply
+STAMP=$(cat "$HERE/../mesa/patch-mesa.py" "$HERE/patches/air-frontend.patch" | shasum | cut -c1-16)
+if [ -d mesa ] && [ "$(cat mesa.stamp 2>/dev/null)" != "$STAMP" ]; then rm -rf mesa build; fi
 if [ ! -d mesa ]; then
   git clone -q --shared "$MESA" mesa
   (cd mesa && python3 "$HERE/../mesa/patch-mesa.py" .)
@@ -43,6 +46,7 @@ EOP
   -Dopengl=true -Dgles2=enabled -Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled \
   -Dvideo-codecs= -Dtools= -Dlmsensors=disabled -Dbuild-tests=false -Dzstd=disabled -Dxmlconfig=disabled \
   -Dexpat=disabled -Dgallium-xa=disabled -Dosmesa=false -Dperfetto=false > setup.log
+echo "$STAMP" > mesa.stamp
 ninja -j"${JOBS:-4}" -C build src/gallium/drivers/panfrost/air_bifrost src/compiler/air/air2nir
 echo "air_bifrost: $WORK/build/src/gallium/drivers/panfrost/air_bifrost"
 echo "air2nir:     $WORK/build/src/compiler/air/air2nir"

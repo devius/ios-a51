@@ -17,7 +17,7 @@ tar -C "$repo/gpu" -cf - metal mesa | ssh "${ssh_opts[@]}" $mac 'tar -C ~/a51bui
 ssh "${ssh_opts[@]}" $mac "export PATH=\$HOME/mesa-venv/bin:/usr/local/bin:\$PATH; cd ~/a51build &&
 	bash gpu-src/metal/build-host.sh ~/a51build/metal-host ~/a51build/mesa-work/mesa ~/a51build/mesa-work/libdrm > metal-host.log 2>&1 ||
 	{ grep -E 'error:|FAILED|ERROR' metal-host.log | head -20; exit 1; }
-	bash gpu-src/metal/test/host/test_air_bifrost.sh $bin"
+	QC_METALLIB=\$HOME/a51build/ios-metallibs/QuartzCore.metallib bash gpu-src/metal/test/host/test_air_bifrost.sh $bin"
 if [ $# -gt 0 ]; then
 	ssh "${ssh_opts[@]}" $mac "python3 ~/a51build/gpu-src/metal/tools/corpus.py --backend bifrost --air2nir ~/a51build/metal-host/build/src/compiler/air/air2nir --compiler $bin $(printf '%q ' "$@")"
 fi

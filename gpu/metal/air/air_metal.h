@@ -579,6 +579,8 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
+/* A51: bytes a texel of an MTLPixelFormat, 0 if this library does not know it. */
+unsigned rwa_pixel_format_bytes(unsigned pixel_format);
 struct rwa_fence;
 struct rwa_fence *rwa_flush(struct rwa_device *device);
 int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size);

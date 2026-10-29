@@ -1761,8 +1761,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
-                            why, sizeof(why)) != 0)
+      /* A51: rows are width x texel bytes aligned to the 64 bytes this device reports as its linear alignment
+       * (deviceLinearReadOnlyTextureAlignmentBytes), which CoreAnimation allocates its image memory by; the
+       * length it passes is rounded up to a page, so length / height was only right when that came out even
+       * (a51_texrows_probe: 30x7 RGBA8 in a 4 KiB page, 180 of 210 texels wrong). */
+      unsigned texel = rwa_pixel_format_bytes((unsigned)_shape.pixel_format);
+      unsigned bpr = texel ? (_shape.width * texel + 63u) & ~63u : (unsigned)(_ncLength / (_shape.height ? _shape.height : 1));
+      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, bpr, why, sizeof(why)) != 0)
          BG_LOG("no-copy texture refresh: %s\n", why);
       bg_unlock();
    }

@@ -70,9 +70,12 @@ rm -f "$OUT/a51_heap_probe.o"
 $OBJC_IOS -I "$HERE/air" -c "$HERE/test/a51/a51_device_limits.m" -o "$OUT/a51_device_limits.o"
 $CC_IOS -o "$OUT/a51_device_limits" "$OUT/a51_device_limits.o" $MTL_LIBS
 rm -f "$OUT/a51_device_limits.o"
+$OBJC_IOS -I "$HERE/air" -c "$HERE/test/a51/a51_texrows_probe.m" -o "$OUT/a51_texrows_probe.o"
+$CC_IOS -o "$OUT/a51_texrows_probe" "$OUT/a51_texrows_probe.o" $MTL_LIBS
+rm -f "$OUT/a51_texrows_probe.o"
 $OBJC_IOS -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foundation
 rm -f "$OUT/bgmtl.o"
 xcrun -sdk iphoneos metal -std=ios-metal2.4 -target air64-apple-ios16.0 "$HERE/test/bg_quad.metal" -o "$OUT/bg_quad.metallib"
-for p in $PROBES mtl_introspect a51_heap_probe a51_device_limits; do codesign -s - -f "$OUT/$p"; done
+for p in $PROBES mtl_introspect a51_heap_probe a51_device_limits a51_texrows_probe; do codesign -s - -f "$OUT/$p"; done
 for f in "$OUT/lib/libairmetal.dylib" "$OUT/a51_device_test" "$OUT/a51_surface_test" "$OUT/bgair_test" "$OUT/bgair_vertex_test" "$OUT/a51_render_diag" "$OUT/a51_surface_threads"; do codesign -s - -f "$f"; done
 otool -L "$OUT/lib/libairmetal.dylib"
