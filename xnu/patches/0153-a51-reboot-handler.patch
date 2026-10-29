@@ -2,14 +2,15 @@ A51: reboot and shutdown from iOS (PE_halt_restart).
 
 Nothing set PE_halt_restart on this port, so IOPlatformExpert::haltRestart()
 returned -1 and a reboot from iOS (Procursus /var/jb/sbin/reboot) hung; the
-only way back was the touch corner gesture into TWRP. Restart now uses PSCI
-SYSTEM_RESET after clearing the recovery request that a warm reset keeps
-(the EL3 firmware's normal reboot: S-Boot boots the boot
-partition again); with sysctl kern.a51_reboot_recovery=1 set first, or for
+only way back was the touch corner gesture into TWRP. Restart now does
+Samsung's normal reboot (sec_reboot.c: INFORM3 = 0x12345670, INFORM2 magic
+byte 0x4e, then PMU SWRESET; PSCI SYSTEM_RESET as a fallback): a warm reset
+keeps the recovery request, and INFORM3 = 0 means "emergency", both of which
+sent S-Boot to TWRP (boots 48, 49); with sysctl kern.a51_reboot_recovery=1 set first, or for
 panic restarts, the recovery magic + SWRESET (TWRP). Shutdown: PSCI
 SYSTEM_OFF. Registered by the touch probe, which maps the PMU at boot.
 diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
-index 8720392..54d7503 100644
+index 8720392..c07f099 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
 @@ -14,6 +14,7 @@
@@ -20,7 +21,7 @@ index 8720392..54d7503 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void thread_terminate_self(void);
-@@ -1330,6 +1331,72 @@ a51_panic_recovery_reset(void)
+@@ -1330,6 +1331,81 @@ a51_panic_recovery_reset(void)
  	a5touch_write(a51_panic_pmu, 0x400, 1u);  /* EXYNOS_SWRESET */
  }
  
@@ -64,16 +65,25 @@ index 8720392..54d7503 100644
 +			a51_panic_recovery_reset();     /* returns only without a PMU mapping */
 +		}
 +		/*
-+		 * Clear the recovery request (INFORM2/3, SPARE2/3): it survives
-+		 * a warm reset, so after the corner gesture or a panic every
-+		 * later reboot went to TWRP again (boot 48). Samsung's normal
-+		 * reboot writes these too.
++		 * A normal reboot as Samsung's sec_reboot() does it: INFORM3
++		 * (reset reason) = SEC_RESET_REASON_UNKNOWN 0x12345670, INFORM2
++		 * bits 16-23 (reboot magic) = SEC_REBOOT_NORMAL 0x4e, then the
++		 * PMU SWRESET (exynos_reboot). Our recovery request's
++		 * SPARE2/3 copies are cleared. Without this S-Boot went to TWRP
++		 * (boot 48); with INFORM3 = 0 (boot 49) too: 0 is
++		 * SEC_RESET_REASON_EMERGENCY.
 +		 */
 +		if (a51_panic_pmu) {
-+			a5touch_write(a51_panic_pmu, 0x808, 0);
-+			a5touch_write(a51_panic_pmu, 0x80c, 0);
++			uint32_t magic = *(volatile uint32_t *)(a51_panic_pmu + 0x808);
++			if (magic == 0x12345678u) {     /* our recovery request */
++				magic = 0;
++			}
++			a5touch_write(a51_panic_pmu, 0x808, (magic & ~0x00ff0000u) | (0x4eu << 16));
++			a5touch_write(a51_panic_pmu, 0x80c, 0x12345670u);
 +			a5touch_write(a51_panic_pmu, 0x908, 0);
 +			a5touch_write(a51_panic_pmu, 0x90c, 0);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			a5touch_write(a51_panic_pmu, 0x400, 1);  /* EXYNOS_SWRESET */
 +			__asm__ volatile ("dsb sy" ::: "memory");
 +		}
 +		a51_psci(0x84000009);           /* SYSTEM_RESET */
@@ -93,7 +103,7 @@ index 8720392..54d7503 100644
  void
  a5xelte_touch_probe(void)
  {
-@@ -1339,6 +1406,7 @@ a5xelte_touch_probe(void)
+@@ -1339,6 +1415,7 @@ a5xelte_touch_probe(void)
  	if (panic_reset) {
  		a51_panic_pmu = ml_io_map(0x11860000u, 0x1000);
  	}
